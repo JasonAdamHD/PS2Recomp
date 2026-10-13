@@ -2,6 +2,7 @@
 #include "runtime/gs/gs_cpu_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+#include <cstdlib>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -552,11 +553,29 @@ void GS::latchHostPresentationFrame()
     }
 
     const bool hasFrame = static_cast<bool>(frame);
+    uint32_t litPixels = 0u;
+    for (size_t i = 0; i + 3 < frame.pixels.size(); i += 4)
+        if ((frame.pixels[i] | frame.pixels[i + 1] | frame.pixels[i + 2]) != 0u)
+            ++litPixels;
     const uint32_t displayFbp = frame.displayFbp;
     const uint32_t sourceFbp = frame.sourceFbp;
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
     const bool usedPreferred = frame.usedPreferred;
+    // Some games (e.g. Billy & Mandy) display a buffer the runtime never fills, so presentation falls back to
+    // the draw buffer, which every other vsync has just been cleared. Hold the last lit frame across a single
+    // all-black present instead of flashing black; a real black screen still shows from the second black frame.
+    static uint32_t consecutiveBlackPresents = 0u;
+    static bool lastPresentLit = false;
+    const bool presentIsBlack = hasFrame && litPixels == 0u;
+    consecutiveBlackPresents = presentIsBlack ? consecutiveBlackPresents + 1u : 0u;
+    if (presentIsBlack && consecutiveBlackPresents < 2u)
+    {
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        if (m_hasHostPresentationFrame && lastPresentLit)
+            return;
+    }
+    lastPresentLit = litPixels != 0u;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
@@ -572,6 +591,19 @@ void GS::latchHostPresentationFrame()
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);
+    }
+
+    // PS2X_LOG_PRESENT=1 logs the display registers and the buffer chosen for each presented frame.
+    static const bool logPresent = std::getenv("PS2X_LOG_PRESENT") != nullptr;
+    static uint32_t presentLogCount = 0u;
+    if (logPresent && presentLogCount < 4000u)
+    {
+        ++presentLogCount;
+        std::cerr << "[present] tick=" << request.vsyncTick << std::hex << " pmode=0x" << request.pmode
+                  << " dispfb1=0x" << request.dispfb1 << " dispfb2=0x" << request.dispfb2
+                  << " ctx0fbp=0x" << request.contextFrames[0].fbp << " ctx1fbp=0x" << request.contextFrames[1].fbp
+                  << " shown=0x" << displayFbp << " src=0x" << sourceFbp << std::dec
+                  << " pref=" << (usedPreferred ? 1 : 0) << " lit=" << litPixels << std::endl;
     }
 }
 

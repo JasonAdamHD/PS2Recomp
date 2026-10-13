@@ -1,5 +1,8 @@
 include(CheckIPOSupported)
 
+# Identical-COMDAT folding is single-threaded and can take over an hour on very large generated runners.
+option(PS2X_RELEASE_ICF "Fold identical functions (/OPT:ICF) when linking release builds" ON)
+
 check_ipo_supported(RESULT IPO_SUPPORTED OUTPUT IPO_ERROR)
 
 function(EnableFastReleaseMode TargetName)
@@ -28,7 +31,7 @@ function(EnableFastReleaseMode TargetName)
                 $<$<CONFIG:Release>:
                     /LTCG # link-time code generation
                     /OPT:REF # remove unreferenced
-                    /OPT:ICF # fold identical COMDATs
+                    $<IF:$<BOOL:${PS2X_RELEASE_ICF}>,/OPT:ICF,/OPT:NOICF> # fold identical COMDATs
                 >
             )
         endif()

@@ -1,6 +1,11 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace
 {
@@ -117,6 +122,52 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
             clearBit(PAD_START);
         if (IsKeyDown(KEY_TAB))
             clearBit(PAD_SELECT);
+    }
+
+    // Test aid: PS2X_AUTOPRESS="cross@600,start@640" holds the named button for ~1.5 s at each listed
+    // number of seconds after launch, so automated runs can step through menus.
+    {
+        struct ScriptedPress
+        {
+            double atSeconds = 0.0;
+            uint16_t bit = 0;
+        };
+        static const std::vector<ScriptedPress> presses = []
+        {
+            std::vector<ScriptedPress> parsed;
+            const char *script = std::getenv("PS2X_AUTOPRESS");
+            if (!script)
+                return parsed;
+            const std::pair<const char *, uint16_t> names[] = {
+                {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE}, {"triangle", PAD_TRIANGLE},
+                {"start", PAD_START}, {"select", PAD_SELECT}, {"up", PAD_UP}, {"down", PAD_DOWN},
+                {"left", PAD_LEFT}, {"right", PAD_RIGHT}};
+            std::string text(script);
+            size_t begin = 0;
+            while (begin < text.size())
+            {
+                const size_t end = std::min(text.find(',', begin), text.size());
+                const std::string item = text.substr(begin, end - begin);
+                const size_t at = item.find('@');
+                if (at != std::string::npos)
+                {
+                    const std::string name = item.substr(0, at);
+                    for (const auto &[label, bit] : names)
+                        if (name == label)
+                            parsed.push_back({std::atof(item.c_str() + at + 1), bit});
+                }
+                begin = end + 1;
+            }
+            return parsed;
+        }();
+        static const auto start = std::chrono::steady_clock::now();
+        if (!presses.empty())
+        {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+            for (const ScriptedPress &press : presses)
+                if (now >= press.atSeconds && now < press.atSeconds + 1.5)
+                    clearBit(press.bit);
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

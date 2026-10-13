@@ -3,6 +3,16 @@
 
 namespace ps2_syscalls
 {
+    namespace
+    {
+        // Bottom of the main thread stack recorded by SetupThread. The guest heap (SetupHeap/EndOfHeap)
+        // may grow up to here, as on the real kernel. Defaults to a 128 KiB stack at the top of RAM.
+        uint32_t g_mainThreadStackBottom = PS2_RAM_SIZE - 0x20000u;
+
+        // Limit of the game's sbrk heap as configured by SetupHeap (0 = not set yet).
+        uint32_t g_guestSbrkLimit = 0u;
+    }
+
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
@@ -491,22 +501,12 @@ namespace ps2_syscalls
                                        : 0u;
         if (stack == 0xFFFFFFFFu)
         {
-            if (stackSizeSigned > 0)
-            {
-                const uint32_t requestedSize = static_cast<uint32_t>(stackSizeSigned);
-                if (requestedSize < PS2_RAM_SIZE)
-                {
-                    sp = PS2_RAM_SIZE - requestedSize;
-                }
-                else
-                {
-                    sp = PS2_RAM_SIZE;
-                }
-            }
-            else
-            {
-                sp = PS2_RAM_SIZE;
-            }
+            // Like the real kernel: the stack occupies the top stack_size bytes of RAM and sp starts at
+            // the top, so the heap may grow right up to the stack bottom (see SetupHeap/EndOfHeap).
+            sp = PS2_RAM_SIZE - 0x10u;
+            g_mainThreadStackBottom = (stackSize > 0u && stackSize < PS2_RAM_SIZE)
+                                          ? PS2_RAM_SIZE - stackSize
+                                          : PS2_RAM_SIZE;
         }
         else if (stack != 0u)
         {
@@ -518,12 +518,13 @@ namespace ps2_syscalls
             {
                 sp = stack;
             }
+            g_mainThreadStackBottom = stack;
         }
 
         sp &= ~0xFu;
         if (stack == 0xFFFFFFFFu)
         {
-            initialStack = sp;
+            initialStack = g_mainThreadStackBottom;
         }
         else if (stack != 0u)
         {
@@ -542,8 +543,9 @@ namespace ps2_syscalls
 
         const uint32_t heapBase = (heapBaseRaw + 0xFu) & ~0xFu;
 
-        // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM".
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // Silent Hill and other games often pass -1 (0xFFFFFFFF) to mean "rest of RAM", i.e. up to the
+        // bottom of the main thread stack (Billy & Mandy needs ~25 MiB of its 32 MiB this way).
+        const uint32_t kDefaultGuestHeapEnd = g_mainThreadStackBottom;
         uint32_t heapLimit = kDefaultGuestHeapEnd;
 
         if (heapSize != 0u && heapSize != 0xFFFFFFFFu)
@@ -557,23 +559,20 @@ namespace ps2_syscalls
             heapLimit = kDefaultGuestHeapEnd;
         }
 
-        if (runtime)
-        {
-            runtime->configureGuestHeap(heapBase, heapLimit);
+        // The game's sbrk heap is tracked here only. It must not be handed to the runtime's own guest
+        // heap (guestMalloc), which lives in the kernel window: sharing the range let runtime stubs
+        // overwrite the game's malloc bookkeeping (Billy & Mandy's newlib top chunk at the heap start).
+        (void)runtime;
+        g_guestSbrkLimit = heapLimit;
 
-            PS2_IF_AGRESSIVE_LOGS({
-                std::cerr << "[SetupHeap]"
-                          << " base=0x" << std::hex << heapBaseRaw
-                          << " alignedBase=0x" << heapBase
-                          << " size=0x" << heapSize
-                          << " runtimeBase=0x" << runtime->guestHeapBase()
-                          << " runtimeEnd=0x" << runtime->guestHeapEnd()
-                          << std::dec << std::endl;
-            });
-
-            setReturnU32(ctx, runtime->guestHeapBase());
-            return;
-        }
+        PS2_IF_AGRESSIVE_LOGS({
+            std::cerr << "[SetupHeap]"
+                      << " base=0x" << std::hex << heapBaseRaw
+                      << " alignedBase=0x" << heapBase
+                      << " size=0x" << heapSize
+                      << " limit=0x" << heapLimit
+                      << std::dec << std::endl;
+        });
 
         setReturnU32(ctx, heapBase);
     }
@@ -582,12 +581,17 @@ namespace ps2_syscalls
     void EndOfHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
+        (void)runtime;
 
-        static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
+        // Returns the game's sbrk heap limit set by SetupHeap (default: bottom of the main stack).
+        const uint32_t ret = (g_guestSbrkLimit != 0u) ? g_guestSbrkLimit : g_mainThreadStackBottom;
 
-        const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
-                                 : kDefaultGuestHeapEnd;
+        PS2_IF_AGRESSIVE_LOGS({
+            std::cerr << "[EndOfHeap] ret=0x" << std::hex << ret
+                      << " ra=0x" << getRegU32(ctx, 31)
+                      << " a0=0x" << getRegU32(ctx, 4)
+                      << std::dec << std::endl;
+        });
 
         setReturnU32(ctx, ret);
     }

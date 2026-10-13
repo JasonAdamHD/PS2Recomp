@@ -2,9 +2,21 @@
 
 #include "ps2_stubs.h"
 
+#include <functional>
+#include <vector>
+
 namespace ps2_stubs
 {
     bool dispatchSifCommand(uint8_t *rdram, PS2Runtime *runtime, uint32_t commandId, const void *packet, size_t packetSize) noexcept;
+    // IOP -> EE RPC: look up an EE-registered server and run its function on the EE scheduler.
+    uint32_t findEeRpcServer(uint32_t sid) noexcept;
+    bool callEeRpcServer(uint8_t *rdram,
+                         PS2Runtime *runtime,
+                         uint32_t sid,
+                         uint32_t rpcNumber,
+                         const std::vector<uint8_t> &send,
+                         uint32_t receiveSize,
+                         std::function<void(const uint8_t *, size_t)> onReply);
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

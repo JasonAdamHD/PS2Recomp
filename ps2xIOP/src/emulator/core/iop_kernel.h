@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
 
 namespace ps2x::iop::detail
 {
@@ -58,6 +59,9 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
 
         void sleepCurrent(IopCpuState &cpu);
+        // Id of the scheduled thread whose register file is `cpu`, or 0 for nested host-driven calls.
+        [[nodiscard]] int threadIdForCpu(const IopCpuState &cpu) const noexcept;
+        void wakeSleepingThread(int id);
         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
 
         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
@@ -67,6 +71,7 @@ namespace ps2x::iop::detail
         void terminateThreadsInRange(uint32_t base, uint32_t size);
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
+        [[nodiscard]] std::string describeThreads() const;
 
     private:
         struct Semaphore

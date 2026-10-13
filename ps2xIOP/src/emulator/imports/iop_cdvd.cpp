@@ -10,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <sstream>
 #include <filesystem>
 #include <limits>
 #include <string>
@@ -228,7 +229,18 @@ namespace ps2x::iop::detail
                 return true;
 
             case 6: // sceCdRead
-                if (readSectors(a0, a1, a2))
+            {
+                const bool ok = readSectors(a0, a1, a2);
+                static uint32_t readLogCount = 0u;
+                if (++readLogCount <= 200u || (readLogCount % 200u) == 0u)
+                {
+                    std::ostringstream out;
+                    out << "[IOP:cdvd] sceCdRead#" << readLogCount << " lsn=0x" << std::hex << a0
+                        << " sectors=0x" << a1 << " dst=0x" << a2 << " ok=" << std::dec << ok
+                        << " err=0x" << std::hex << lastError;
+                    host.log(LogLevel::Info, out.str());
+                }
+                if (ok)
                 {
                     signalCommandComplete();
                     if (callback.address != 0u)
@@ -244,6 +256,7 @@ namespace ps2x::iop::detail
                 else
                     cpu.gpr[2] = 0u;
                 return true;
+            }
 
             case 7: // sceCdSeek
                 currentLsn = a0;
@@ -265,12 +278,37 @@ namespace ps2x::iop::detail
                 return true;
 
             case 10: // sceCdSearchFile
-                cpu.gpr[2] = searchFile(a0, a1) ? 1u : 0u;
+            {
+                const bool found = searchFile(a0, a1);
+                cpu.gpr[2] = found ? 1u : 0u;
+                std::string name;
+                for (uint32_t i = 0; i < 128u; ++i)
+                {
+                    const char c = static_cast<char>(memory.read8(a1 + i));
+                    if (c == '\0')
+                        break;
+                    name.push_back(c);
+                }
+                std::ostringstream out;
+                out << "[IOP:cdvd] sceCdSearchFile path=\"" << name << "\" found=" << found;
+                if (found)
+                    out << " lsn=0x" << std::hex << memory.read32(a0) << " size=0x" << memory.read32(a0 + 4u);
+                host.log(LogLevel::Info, out.str());
                 return true;
+            }
 
             case 11: // sceCdSync
+            {
+                static uint32_t syncLogCount = 0u;
+                if (++syncLogCount <= 20u || (syncLogCount % 1000u) == 0u)
+                {
+                    std::ostringstream out;
+                    out << "[IOP:cdvd] sceCdSync#" << syncLogCount << " mode=" << a0;
+                    host.log(LogLevel::Info, out.str());
+                }
                 cpu.gpr[2] = 0u;
                 return true;
+            }
 
             case 12: // sceCdGetDiskType
                 cpu.gpr[2] = kCdvdTypePs2Dvd;

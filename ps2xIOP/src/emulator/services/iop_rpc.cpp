@@ -5,6 +5,7 @@
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -77,6 +78,16 @@ namespace ps2x::iop::detail
                     continue;
 
                 const uint32_t size = static_cast<uint32_t>(signedSize);
+                static uint32_t iopDmaLogCount = 0u;
+                if (++iopDmaLogCount <= 300u || (iopDmaLogCount % 500u) == 0u)
+                {
+                    char line[200];
+                    std::snprintf(line, sizeof(line), "[IOP:sifdma#%u] src=0x%x dst=0x%x size=0x%x attr=0x%x owned=%d data=%x %x %x %x",
+                                  iopDmaLogCount, source, destination, size, descriptorWords[i * 4u + 3u],
+                                  m_memory.ownsRamRange(source, size) ? 1 : 0, m_memory.read32(source),
+                                  m_memory.read32(source + 4u), m_memory.read32(source + 8u), m_memory.read32(source + 12u));
+                    m_host.log(LogLevel::Info, line);
+                }
                 if (!m_memory.ownsRamRange(source, size))
                 {
                     setV0(0u);
@@ -148,10 +159,81 @@ namespace ps2x::iop::detail
         case 10:
         case 11:
         case 14: // InitRpc
-        case 15:
-        case 16:
             setV0(0);
             return true;
+        case 15: // sceSifBindRpc(client, sid, mode) against an EE-side server
+        {
+            constexpr uint32_t kClientServerOffset = 0x24u;
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t sid = cpu.gpr[5];
+            const bool bound = client != 0u && m_host.hasEeRpcServer(sid);
+            if (client != 0u)
+            {
+                // IOP modules only test the server pointer for non-zero; the client address is a stable token.
+                (void)m_memory.write32(client + kClientServerOffset, bound ? client : 0u);
+                if (bound)
+                    m_eeRpcClients[client] = sid;
+            }
+            static uint32_t bindLogCount = 0u;
+            if (++bindLogCount <= 16u)
+            {
+                char line[96];
+                std::snprintf(line, sizeof(line), "[IOP:eerpc] bind client=0x%x sid=0x%x bound=%d", client, sid, bound ? 1 : 0);
+                m_host.log(LogLevel::Info, line);
+            }
+            setV0(0);
+            return true;
+        }
+        case 16: // sceSifCallRpc(client, rpcNumber, mode, send, ssize, recv, rsize, endFunc, endParam)
+        {
+            const uint32_t client = cpu.gpr[4];
+            const uint32_t rpcNumber = cpu.gpr[5];
+            const uint32_t send = cpu.gpr[7];
+            const uint32_t sp = cpu.gpr[29];
+            const uint32_t sendSize = m_memory.read32(sp + 0x10u);
+            const uint32_t receive = m_memory.read32(sp + 0x14u);
+            const uint32_t receiveSize = m_memory.read32(sp + 0x18u);
+            const auto clientIt = m_eeRpcClients.find(client);
+            if (clientIt == m_eeRpcClients.end() || sendSize > 0x10000u || receiveSize > 0x10000u)
+            {
+                setV0(0xFFFFFFFFu);
+                return true;
+            }
+
+            std::vector<uint8_t> payload(sendSize);
+            if (sendSize != 0u && !m_memory.readRam(send, payload.data(), payload.size()))
+            {
+                setV0(0xFFFFFFFFu);
+                return true;
+            }
+
+            // The EE server runs on the EE scheduler; its reply lands in the IOP receive buffer when it returns.
+            // A blocking call from a scheduled thread sleeps until then, so code reading the reply right
+            // after sceSifCallRpc sees it. Nested host-driven calls cannot block and continue immediately.
+            constexpr uint32_t kRpcModeNoWait = 1u;
+            const uint32_t mode = cpu.gpr[6];
+            const int waitingThread = (mode & kRpcModeNoWait) == 0u ? m_kernel.threadIdForCpu(cpu) : 0;
+            const bool queued = m_host.callEeRpc(clientIt->second, rpcNumber, payload, receiveSize,
+                                                 [this, receive, waitingThread](const uint8_t *data, size_t size)
+                                                 {
+                                                     if (receive != 0u && size != 0u)
+                                                         (void)m_memory.writeRam(receive, data, size);
+                                                     if (waitingThread != 0)
+                                                         m_kernel.wakeSleepingThread(waitingThread);
+                                                 });
+            if (queued && waitingThread != 0)
+                m_kernel.sleepCurrent(cpu);
+            static uint32_t callLogCount = 0u;
+            if (++callLogCount <= 40u)
+            {
+                char line[160];
+                std::snprintf(line, sizeof(line), "[IOP:eerpc] call sid=0x%x fno=%u send=0x%x/0x%x recv=0x%x/0x%x queued=%d thread=%d",
+                              clientIt->second, rpcNumber, send, sendSize, receive, receiveSize, queued ? 1 : 0, waitingThread);
+                m_host.log(LogLevel::Info, line);
+            }
+            setV0(queued ? 0u : 0xFFFFFFFFu);
+            return true;
+        }
         case 12: // sceSifSendCmd
         case 13: // isceSifSendCmd
         {
@@ -273,6 +355,44 @@ namespace ps2x::iop::detail
         }
     }
 
+    void IopRpcBridge::logCommandPacket(uint32_t sid, const std::vector<uint8_t> &payload)
+    {
+        // Decodes the Atlas IO packet (0x48, count, {id, argc, args...}) so new EE requests show up in the log.
+        if (sid != 0x12345u || payload.size() < 4u)
+            return;
+        const auto half = [&](size_t index) -> uint16_t
+        {
+            return index * 2u + 1u < payload.size() ? static_cast<uint16_t>(payload[index * 2u] | (payload[index * 2u + 1u] << 8u)) : 0u;
+        };
+        if (half(0) != 0x48u)
+            return;
+        std::string text;
+        size_t cursor = 2u;
+        const uint16_t count = half(1);
+        for (uint16_t i = 0; i < count && cursor * 2u + 3u < payload.size(); ++i)
+        {
+            const uint16_t id = half(cursor);
+            const uint16_t argc = half(cursor + 1u);
+            cursor += 2u;
+            char entry[32];
+            std::snprintf(entry, sizeof(entry), " %x(", id);
+            text += entry;
+            for (uint16_t a = 0; a < argc && a < 12u; ++a)
+            {
+                std::snprintf(entry, sizeof(entry), a ? ",%x" : "%x", half(cursor + a));
+                text += entry;
+            }
+            text += ")";
+            cursor += argc;
+        }
+        if (text == m_lastCommandText)
+            return;
+        m_lastCommandText = text;
+        static uint32_t logged = 0u;
+        if (++logged <= 3000u)
+            m_host.log(LogLevel::Info, "[IOP:atcmd]" + text);
+    }
+
     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
     {
         RpcResult result{};
@@ -288,7 +408,10 @@ namespace ps2x::iop::detail
             {
                 std::vector<uint8_t> payload(copySize);
                 if (m_host.readGuest(request.send.address, payload.data(), payload.size()))
+                {
                     (void)m_memory.writeRam(server.buffer, payload.data(), payload.size());
+                    logCommandPacket(request.sid, payload);
+                }
             }
         }
 
@@ -309,6 +432,32 @@ namespace ps2x::iop::detail
                 (void)m_host.writeGuest(request.receive.address, m_memory.ram().data() + physical, copySize);
                 if (copySize < request.receive.size)
                     (void)m_host.zeroGuest(request.receive.address + copySize, request.receive.size - copySize);
+            }
+        }
+
+        if (request.sid == 0x12345u && returnPointer != 0u)
+        {
+            // Reply layout: word0 = record count | flags << 8, then 9-word slot records, then a status tail.
+            const uint32_t header = m_memory.read32(returnPointer);
+            const uint32_t records = header & 0xFFu;
+            std::string text;
+            char entry[96];
+            for (uint32_t r = 0; r < records && r < 8u; ++r)
+            {
+                const uint32_t base = returnPointer + 4u + r * 36u;
+                std::snprintf(entry, sizeof(entry), " rec{w0=%x type=%x done=%x}", m_memory.read32(base),
+                              m_memory.read32(base + 12u) & 0xFFu, m_memory.read32(base + 20u));
+                text += entry;
+            }
+            const uint32_t tail = returnPointer + 4u + records * 36u;
+            std::snprintf(entry, sizeof(entry), " tail{block=%x busy=%x}", m_memory.read32(tail + 4u), m_memory.read32(tail + 8u));
+            text += entry;
+            if (text != m_lastReplyText)
+            {
+                m_lastReplyText = text;
+                static uint32_t logged = 0u;
+                if (++logged <= 3000u)
+                    m_host.log(LogLevel::Info, "[IOP:atreply] n=" + std::to_string(records) + text);
             }
         }
 

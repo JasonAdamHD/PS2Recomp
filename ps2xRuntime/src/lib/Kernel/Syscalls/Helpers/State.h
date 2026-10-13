@@ -243,10 +243,13 @@ inline std::filesystem::path g_cdrom_cwd;
 inline std::string g_ps2_cwd_device = "host0";
 
 static constexpr uint32_t kRpcPacketSize = 64;
-static constexpr uint32_t kRpcPacketPoolBase = 0x01F00000;
+// RPC pools live in the kernel-reserved window below 0x00100000 so the guest heap can use all RAM up to
+// the main thread stack (see SetupHeap). Layout of 0x00080000-0x00100000: runtime guest heap
+// 0x80000-0xC0000, RPC packet/server pools 0xC0000-0xE0000, async callback stacks 0xE0000-0x100000.
+static constexpr uint32_t kRpcPacketPoolBase = 0x000C0000;
 static constexpr uint32_t kRpcPacketPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcPacketPoolCount = kRpcPacketPoolBytes / kRpcPacketSize;
-static constexpr uint32_t kRpcServerPoolBase = 0x01F10000;
+static constexpr uint32_t kRpcServerPoolBase = 0x000D0000;
 static constexpr uint32_t kRpcServerPoolBytes = 0x00010000;
 static constexpr uint32_t kRpcServerStride = 0x80;
 static constexpr uint32_t kRpcServerPoolCount = kRpcServerPoolBytes / kRpcServerStride;

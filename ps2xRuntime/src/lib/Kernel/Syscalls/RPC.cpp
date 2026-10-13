@@ -20,6 +20,25 @@ namespace ps2_syscalls
         {
             event.seq = ++g_sif_rpc_debug_next_seq;
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
+
+            // Mirror the debugger's RPC history to the log (first 400 events, then every 500th).
+            PS2_IF_AGRESSIVE_LOGS({
+                if (event.seq <= 400u || (event.seq % 500u) == 0u)
+                {
+                    std::cerr << "[RPC#" << std::dec << event.seq << "] " << event.op << std::hex
+                              << " sid=0x" << event.sid << " fno=0x" << event.rpcNum
+                              << " client=0x" << event.clientPtr << " server=0x" << event.serverPtr
+                              << " send=0x" << event.sendSize << " recv=0x" << event.recvSize
+                              << " mode=0x" << event.mode << " end=0x" << event.endFunc
+                              << " flags=0x" << event.flags << " result=" << std::dec << event.result
+                              << " recvPreview=";
+                    for (uint32_t i = 0; i < event.recvPreviewSize && i < 8u; ++i)
+                    {
+                        std::cerr << std::hex << static_cast<int>(event.recvPreview[i]) << ' ';
+                    }
+                    std::cerr << std::dec << std::endl;
+                }
+            });
         }
 
         void pushSifRpcDebugEvent(SifRpcDebugEvent event)

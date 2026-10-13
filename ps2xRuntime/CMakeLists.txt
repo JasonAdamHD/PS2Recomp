@@ -463,10 +463,37 @@ else()
 endif()
 
 if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+    # Group generated files by guest address (4 KiB code blocks, from the "_0x<addr>" file-name suffix)
+    # instead of fixed-size batches by list position. Adding, removing or renaming a function then only
+    # changes its own group, so Ninja rebuilds a few unity files instead of the whole runner.
     set_target_properties(ps2EntryRunner PROPERTIES
         UNITY_BUILD ON
-        UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+        UNITY_BUILD_MODE GROUP
     )
+    set(PS2X_RUNNER_UNITY_GROUPS "")
+    foreach(PS2X_RUNNER_SRC IN LISTS RUNNER_SRC_FILES)
+        get_filename_component(PS2X_RUNNER_SRC_NAME "${PS2X_RUNNER_SRC}" NAME_WE)
+        set(PS2X_RUNNER_GROUP "misc")
+        if(PS2X_RUNNER_SRC_NAME MATCHES "_0x([0-9a-fA-F]+)$")
+            string(LENGTH "${CMAKE_MATCH_1}" PS2X_RUNNER_ADDR_LEN)
+            if(PS2X_RUNNER_ADDR_LEN GREATER 3)
+                math(EXPR PS2X_RUNNER_ADDR_CUT "${PS2X_RUNNER_ADDR_LEN} - 3")
+                string(SUBSTRING "${CMAKE_MATCH_1}" 0 ${PS2X_RUNNER_ADDR_CUT} PS2X_RUNNER_GROUP)
+                set(PS2X_RUNNER_GROUP "a${PS2X_RUNNER_GROUP}")
+            else()
+                set(PS2X_RUNNER_GROUP "a0")
+            endif()
+        endif()
+        if(NOT DEFINED PS2X_RUNNER_GROUP_FILES_${PS2X_RUNNER_GROUP})
+            list(APPEND PS2X_RUNNER_UNITY_GROUPS "${PS2X_RUNNER_GROUP}")
+        endif()
+        list(APPEND PS2X_RUNNER_GROUP_FILES_${PS2X_RUNNER_GROUP} "${PS2X_RUNNER_SRC}")
+    endforeach()
+    foreach(PS2X_RUNNER_GROUP IN LISTS PS2X_RUNNER_UNITY_GROUPS)
+        set_source_files_properties(${PS2X_RUNNER_GROUP_FILES_${PS2X_RUNNER_GROUP}}
+            TARGET_DIRECTORY ps2EntryRunner
+            PROPERTIES UNITY_GROUP "${PS2X_RUNNER_GROUP}")
+    endforeach()
 endif()
 
 if(PS2X_ENABLE_RUNNER_PCH)
@@ -475,13 +502,9 @@ if(PS2X_ENABLE_RUNNER_PCH)
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
     )
 
-    foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_functions.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_recompiled_stubs.h")
-        if(EXISTS "${PS2X_RUNNER_GENERATED_HEADER}")
-            list(APPEND PS2X_RUNNER_PCH_HEADERS "${PS2X_RUNNER_GENERATED_HEADER}")
-        endif()
-    endforeach()
+    # The generated ps2_recompiled_functions.h / ps2_recompiled_stubs.h are deliberately NOT part of the
+    # PCH: generated function files forward-declare only what they call, so renaming a function no
+    # longer invalidates the PCH and forces every unity batch to rebuild.
 
     list(APPEND PS2X_RUNNER_PCH_HEADERS
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_syscalls.h"
@@ -511,6 +534,14 @@ target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
 )
+
+# Game-specific runtime overrides (PS2_REGISTER_GAME_OVERRIDE) self-register at static init, so they are
+# linked into the runner directly; a static library would drop their unreferenced objects. Game projects
+# keep them in their own repository and point PS2X_GAME_OVERRIDES_DIR at that folder.
+set(PS2X_GAME_OVERRIDES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/games" CACHE PATH "Folder of game-specific override sources")
+file(GLOB PS2X_GAME_OVERRIDE_SOURCES CONFIGURE_DEPENDS "${PS2X_GAME_OVERRIDES_DIR}/*.cpp")
+target_sources(ps2EntryRunner PRIVATE ${PS2X_GAME_OVERRIDE_SOURCES})
+target_include_directories(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE

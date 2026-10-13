@@ -83,6 +83,12 @@ public:
                              uint32_t a3,
                              uint32_t *resultAddress) override;
     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
+    bool hasEeRpcServer(uint32_t sid) override;
+    bool callEeRpc(uint32_t sid,
+                   uint32_t rpcNumber,
+                   const std::vector<uint8_t> &send,
+                   uint32_t receiveSize,
+                   std::function<void(const uint8_t *, size_t)> onReply) override;
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 

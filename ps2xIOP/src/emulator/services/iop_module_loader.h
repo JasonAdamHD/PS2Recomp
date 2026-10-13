@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -43,6 +44,10 @@ namespace ps2x::iop::detail
     public:
         [[nodiscard]] static bool readWholeHostFile(IopHost &host, std::string_view guestPath, std::vector<uint8_t> &bytes);
         [[nodiscard]] static bool readElfFromGuest(IopHost &host, uint32_t guestAddress, std::vector<uint8_t> &bytes);
+        // sceSifLoadModuleBuffer passes an IOP-RAM address (the buffer was DMA'd there with sceSifSetDma).
+        [[nodiscard]] static bool readElfFromIop(const IopMemory &memory, uint32_t iopAddress, std::vector<uint8_t> &bytes);
+        using ReadFn = std::function<bool(uint32_t, void *, size_t)>;
+        [[nodiscard]] static bool readElfWith(const ReadFn &read, uint32_t guestAddress, std::vector<uint8_t> &bytes);
         [[nodiscard]] static IopImageLoadResult load(std::span<const uint8_t> image, IopMemory &memory, uint32_t moduleCursor);
     };
 }

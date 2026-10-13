@@ -5,8 +5,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ps2x::iop
 {
@@ -127,6 +129,28 @@ namespace ps2x::iop
             (void)commandId;
             (void)packet;
             (void)packetSize;
+            return false;
+        }
+
+        // IOP -> EE RPC (sceSifBindRpc/sceSifCallRpc issued by IOP modules against EE servers).
+        // The reply is delivered asynchronously once the EE server function has returned.
+        virtual bool hasEeRpcServer(uint32_t sid)
+        {
+            (void)sid;
+            return false;
+        }
+
+        virtual bool callEeRpc(uint32_t sid,
+                               uint32_t rpcNumber,
+                               const std::vector<uint8_t> &send,
+                               uint32_t receiveSize,
+                               std::function<void(const uint8_t *, size_t)> onReply)
+        {
+            (void)sid;
+            (void)rpcNumber;
+            (void)send;
+            (void)receiveSize;
+            (void)onReply;
             return false;
         }
 

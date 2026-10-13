@@ -3,6 +3,7 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressRange;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Instruction;
@@ -918,7 +919,11 @@ public class ExportPS2Functions extends GhidraScript {
             }
 
             FunctionRecord record = new FunctionRecord();
-            record.name = symbol.getName();
+            // Qualify labels such as caseD_3 with their parent function so they stay readable and unique.
+            Function parent = currentProgram.getFunctionManager().getFunctionContaining(address);
+            record.name = parent == null
+                ? symbol.getName()
+                : parent.getName(true).replace("::", "_") + "_" + symbol.getName();
             record.start = start;
             record.syntheticEntry = true;
             labelRecords.add(record);
@@ -1044,10 +1049,39 @@ public class ExportPS2Functions extends GhidraScript {
             }
 
             FunctionRecord record = new FunctionRecord();
-            record.name = func.getName();
+            // Flatten namespaces (Class::Method -> Class_Method) so names stay valid C++ identifiers.
+            record.name = func.getName(true).replace("::", "_");
             record.start = func.getEntryPoint().getOffset();
-            record.endExclusive = body.getMaxAddress().getOffset() + 1L;
-            record.size = body.getNumAddresses();
+            // Use the contiguous range that contains the entry point. A body can include far-away
+            // chunks (shared tails Ghidra attached to the function); using the body's max address made
+            // tiny functions span 100+ KiB and the recompiler emitted multi-MB jump tables for them.
+            // Span = the entry range plus following body ranges separated only by small gaps (padding or
+            // delay-slot holes) with no other function starting in between. Far-away chunks (shared tails
+            // Ghidra attached to the function) are dropped: using the body max address made tiny functions
+            // span 100+ KiB, while using only the entry range split normal functions into many pieces.
+            AddressRange entryRange = body.getRangeContaining(func.getEntryPoint());
+            if (entryRange != null) {
+                long spanEnd = entryRange.getMaxAddress().getOffset() + 1L;
+                for (AddressRange spanRange : body) {
+                    long spanRangeStart = spanRange.getMinAddress().getOffset();
+                    if (spanRangeStart < spanEnd) {
+                        continue;
+                    }
+                    if (spanRangeStart - spanEnd > 0x100L) {
+                        break;
+                    }
+                    Function spanNext = getFunctionAfter(toAddr(spanEnd - 1L));
+                    if (spanNext != null && spanNext != func && spanNext.getEntryPoint().getOffset() < spanRangeStart) {
+                        break;
+                    }
+                    spanEnd = spanRange.getMaxAddress().getOffset() + 1L;
+                }
+                record.endExclusive = spanEnd;
+                record.size = spanEnd - record.start;
+            } else {
+                record.endExclusive = body.getMaxAddress().getOffset() + 1L;
+                record.size = body.getNumAddresses();
+            }
             functionRecords.add(record);
 
             ClassificationResult classification = classifyFunction(func);

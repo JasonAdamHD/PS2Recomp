@@ -68,10 +68,14 @@ namespace ps2x::iop::detail
             uint32_t queue = 0;
         };
 
+        void logCommandPacket(uint32_t sid, const std::vector<uint8_t> &payload);
+        std::string m_lastCommandText;
+        std::string m_lastReplyText;
         IopHost &m_host;
         IopMemory &m_memory;
         IopKernel &m_kernel;
         std::unordered_map<uint32_t, RpcServer> m_servers;
+        std::unordered_map<uint32_t, uint32_t> m_eeRpcClients; // IOP client address -> EE server sid
         uint32_t m_nextDmaId = 1u;
         bool m_sifInitialized = false;
     };

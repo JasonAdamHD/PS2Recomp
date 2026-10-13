@@ -7,6 +7,7 @@
 #include "ps2recomp/types.h"
 
 #include <algorithm>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -24,6 +25,58 @@ namespace ps2recomp
             inst.function = SPECIAL_SLL;
             return inst;
         }
+
+        bool isIdentChar(char c)
+        {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        }
+
+        bool isHexDigit(char c)
+        {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }
+
+        // Forward declarations for every generated function a body references. Generated function
+        // names always end in "_0x<hex address>". Declaring per file (instead of including the
+        // all-functions header) means a rename only rebuilds the files that mention that function.
+        std::string buildForwardDeclarations(const std::string &body)
+        {
+            std::set<std::string> names;
+            size_t pos = body.find("_0x");
+            while (pos != std::string::npos)
+            {
+                size_t begin = pos;
+                while (begin > 0 && isIdentChar(body[begin - 1]))
+                {
+                    --begin;
+                }
+                size_t end = pos + 3;
+                while (end < body.size() && isHexDigit(body[end]))
+                {
+                    ++end;
+                }
+                const bool hasDigits = end > pos + 3;
+                const bool startsIdent = begin < pos && !(body[begin] >= '0' && body[begin] <= '9');
+                const bool cleanEnd = end >= body.size() || !isIdentChar(body[end]);
+                if (hasDigits && startsIdent && cleanEnd)
+                {
+                    names.insert(body.substr(begin, end - begin));
+                }
+                pos = body.find("_0x", pos + 3);
+            }
+
+            std::string decls;
+            if (!names.empty())
+            {
+                decls += "// Generated functions referenced by this file.\n";
+                for (const std::string &name : names)
+                {
+                    decls += "void " + name + "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);\n";
+                }
+                decls += "\n";
+            }
+            return decls;
+        }
     }
 
     FunctionEmitter::FunctionEmitter(CodeGenerator &codeGenerator)
@@ -40,18 +93,20 @@ namespace ps2recomp
         std::stringstream ss;
         cg.m_currentFunctionName = function.name;
 
+        std::string::size_type headerEnd = 0;
         if (useHeaders)
         {
+            // No ps2_recompiled_functions.h / ps2_recompiled_stubs.h here: the functions this file
+            // calls are forward-declared after the includes (see buildForwardDeclarations).
             ss << "#include <stdexcept>\n";
             ss << "#include \"ps2_runtime_macros.h\"\n";
             ss << "#include \"ps2_runtime.h\"\n";
-            ss << "#include <ps2_recompiled_functions.h>\n";
-            ss << "#include <ps2_recompiled_stubs.h>\n\n";
             ss << "#include \"ps2_syscalls.h\"\n";
             ss << "#include \"ps2_stubs.h\"\n\n";
             ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
             ss << "#include \"ps2_log.h\"\n";
             ss << "#endif\n\n";
+            headerEnd = ss.str().size();
         }
 
         CodeGenerator::AnalysisResult analysisResult = cg.collectInternalBranchTargets(function, instructions);
@@ -234,6 +289,12 @@ namespace ps2recomp
         }
 
         ss << "}\n";
-        return ss.str();
+
+        std::string out = ss.str();
+        if (useHeaders)
+        {
+            out.insert(headerEnd, buildForwardDeclarations(out.substr(headerEnd)));
+        }
+        return out;
     }
 }

@@ -4,6 +4,7 @@
 #include "ps2_log.h"
 #include "runtime/ee_scheduler.h"
 
+#include <cstdlib>
 #include <unordered_set>
 #include "Kernel/Syscalls/Helpers/State.h"
 #include "Kernel/Stubs/CD.h"
@@ -2183,6 +2184,9 @@ void PS2DebugPanel::initialize()
     {
         rlImGuiSetup(true);
         m_initialized = true;
+        // PS2X_HIDE_DEBUG starts with the panel hidden (F1 still toggles it), e.g. for screenshots.
+        if (std::getenv("PS2X_HIDE_DEBUG") != nullptr)
+            m_visible = false;
     }
 #endif
 }

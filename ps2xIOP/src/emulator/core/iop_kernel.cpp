@@ -4,6 +4,7 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
 
 namespace ps2x::iop::detail
 {
@@ -660,6 +661,22 @@ namespace ps2x::iop::detail
         cpu.yielded = true;
     }
 
+    int IopKernel::threadIdForCpu(const IopCpuState &cpu) const noexcept
+    {
+        return m_currentThread != nullptr && &m_currentThread->cpu == &cpu ? m_currentThread->id : 0;
+    }
+
+    void IopKernel::wakeSleepingThread(int id)
+    {
+        const auto it = m_threads.find(id);
+        if (it == m_threads.end())
+            return;
+        if (it->second.state == IopThreadState::Sleep)
+            it->second.state = IopThreadState::Ready;
+        else
+            ++it->second.wakeupCount;
+    }
+
     void IopKernel::delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu)
     {
         if (m_currentThread == nullptr)
@@ -740,5 +757,31 @@ namespace ps2x::iop::detail
             if (pc >= base && pc < base + size)
                 thread.state = IopThreadState::Dead;
         }
+    }
+
+    std::string IopKernel::describeThreads() const
+    {
+        static const char *const kStateNames[] = {"dormant", "ready", "running", "sleep", "delay", "sema", "evflag", "suspended", "dead"};
+        std::string out;
+        char line[256];
+        for (const auto &[id, thread] : m_threads)
+        {
+            const auto stateIndex = static_cast<size_t>(thread.state);
+            std::snprintf(line, sizeof(line), " [t%d %s pc=0x%x ra=0x%x entry=0x%x prio=%u wait=%d bits=0x%x wake=%d]",
+                          id, stateIndex < 9 ? kStateNames[stateIndex] : "?", thread.cpu.pc, thread.cpu.gpr[31],
+                          thread.entry, thread.priority, thread.waitId, thread.waitBits, thread.wakeupCount);
+            out += line;
+        }
+        for (const auto &[id, sema] : m_semaphores)
+        {
+            std::snprintf(line, sizeof(line), " [sema%d %d/%d]", id, sema.current, sema.maximum);
+            out += line;
+        }
+        for (const auto &[id, flag] : m_eventFlags)
+        {
+            std::snprintf(line, sizeof(line), " [ev%d bits=0x%x]", id, flag.bits);
+            out += line;
+        }
+        return out;
     }
 }

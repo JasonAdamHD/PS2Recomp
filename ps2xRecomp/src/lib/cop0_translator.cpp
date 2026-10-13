@@ -44,7 +44,8 @@ namespace ps2recomp
             case COP0_REG_BADVADDR:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_badvaddr);", rt);
             case COP0_REG_COUNT:
-                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_count);", rt);
+                // Count ticks at the EE clock; games busy-wait on it, so it must advance in real time.
+                return fmt::format("{{ extern uint32_t ps2ReadCop0Count() noexcept; SET_GPR_S32(ctx, {}, (int32_t)ps2ReadCop0Count()); }}", rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)ctx->cop0_entryhi);", rt);
             case COP0_REG_COMPARE:
@@ -94,7 +95,7 @@ namespace ps2recomp
             case COP0_REG_BADVADDR:
                 return "// MTC0 to BADVADDR register ignored (read-only)";
             case COP0_REG_COUNT:
-                return fmt::format("ctx->cop0_count = GPR_U32(ctx, {});", rt);
+                return fmt::format("{{ extern void ps2WriteCop0Count(uint32_t) noexcept; ps2WriteCop0Count(GPR_U32(ctx, {})); }}", rt);
             case COP0_REG_ENTRYHI:
                 return fmt::format("ctx->cop0_entryhi = GPR_U32(ctx, {}) & 0xC00000FF;", rt);
             case COP0_REG_COMPARE:

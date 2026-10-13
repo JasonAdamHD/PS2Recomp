@@ -20,12 +20,41 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <chrono>
 #include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+
+namespace
+{
+    // COP0 Count runs at the EE core clock (294.912 MHz). It is derived from the host clock so
+    // guest busy-waits on Count complete in real time; MTC0 Count rebases it.
+    constexpr uint64_t kEeClockHz = 294'912'000ull;
+    const std::chrono::steady_clock::time_point g_cop0CountEpoch = std::chrono::steady_clock::now();
+    std::atomic<uint32_t> g_cop0CountBias{0u};
+
+    uint32_t elapsedEeCycles() noexcept
+    {
+        const auto elapsed = std::chrono::steady_clock::now() - g_cop0CountEpoch;
+        const auto nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+        return static_cast<uint32_t>((nanoseconds / 1000ull) * (kEeClockHz / 1'000'000ull) +
+                                     ((nanoseconds % 1000ull) * (kEeClockHz / 1'000'000ull)) / 1000ull);
+    }
+}
+
+uint32_t ps2ReadCop0Count() noexcept
+{
+    return elapsedEeCycles() + g_cop0CountBias.load(std::memory_order_relaxed);
+}
+
+void ps2WriteCop0Count(uint32_t value) noexcept
+{
+    g_cop0CountBias.store(value - elapsedEeCycles(), std::memory_order_relaxed);
+}
+
 
 namespace ps2_stubs
 {
@@ -88,9 +117,16 @@ struct ProgramHeader
 namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
+    constexpr uint32_t kRuntimeGuestHeapBase = 0x00080000u; // start of the runtime-owned guest heap
     constexpr uint32_t kGuestHeapDefaultAlignment = 16u;
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
-    constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
+    // Runtime-owned guest memory (guestMalloc for HLE stubs, RPC pools, async callback stacks) lives in
+    // the kernel-reserved window 0x00080000-0x00100000, like the real kernel's own memory. The game's
+    // sbrk heap (SetupHeap/EndOfHeap) is tracked separately and may use all RAM up to the main stack,
+    // so the two can never overwrite each other's bookkeeping.
+    constexpr uint32_t kGuestHeapHardLimit = 0x000C0000u;
+    constexpr uint32_t kAsyncCallbackStackFloor = 0x000E0000u;
+    constexpr uint32_t kAsyncCallbackStackTop = 0x00100000u;
 
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
@@ -498,13 +534,13 @@ PS2Runtime::PS2Runtime()
 
     m_loadedModules.clear();
     m_guestHeapBlocks.clear();
-    m_guestHeapBase = kGuestHeapDefaultBase;
-    m_guestHeapEnd = kGuestHeapDefaultBase;
+    m_guestHeapBase = kRuntimeGuestHeapBase;
+    m_guestHeapEnd = kRuntimeGuestHeapBase;
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
+    m_guestHeapSuggestedBase = kRuntimeGuestHeapBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+    m_asyncCallbackStackTop = kAsyncCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -962,8 +998,11 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         std::lock_guard<std::mutex> lock(m_guestHeapMutex);
         if (!m_guestHeapConfigured)
         {
+            // The runtime heap stays in its kernel-window slot; the area after the ELF belongs to the
+            // game's own sbrk heap (suggestedHeapBase is only the game's natural heap start).
+            (void)suggestedHeapBase;
             const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-            m_guestHeapSuggestedBase = std::min(suggestedHeapBase, hardLimit);
+            m_guestHeapSuggestedBase = kRuntimeGuestHeapBase;
             m_guestHeapBase = m_guestHeapSuggestedBase;
             m_guestHeapEnd = m_guestHeapSuggestedBase;
             m_guestHeapLimit = hardLimit;
@@ -971,9 +1010,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+        m_asyncCallbackStackTop = kAsyncCallbackStackTop;
     }
 
     LoadedModule module;
@@ -1353,6 +1391,41 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    // Debug aid: PS2X_DUMP_AT=<hex pc> PS2X_DUMP_RANGE=<hex addr>:<hex size> prints guest memory
+    // each time a call reaches that pc (first 8 hits).
+    {
+        static const uint32_t dumpAt = []
+        {
+            const char *value = std::getenv("PS2X_DUMP_AT");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 16)) : 0u;
+        }();
+        static uint32_t dumpHits = 0u;
+        if (dumpAt != 0u && targetPc == dumpAt && isCall && dumpHits < 8u)
+        {
+            ++dumpHits;
+            uint32_t dumpAddress = 0u;
+            uint32_t dumpSize = 0u;
+            if (const char *range = std::getenv("PS2X_DUMP_RANGE"))
+            {
+                char *end = nullptr;
+                dumpAddress = static_cast<uint32_t>(std::strtoul(range, &end, 16));
+                if (end && *end == ':')
+                    dumpSize = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
+            }
+            std::cerr << "[dump] pc=0x" << std::hex << targetPc << " from=0x" << sourcePc << " ra=0x"
+                      << getRegU32(ctx, 31) << " a0=0x" << getRegU32(ctx, 4) << " mem@0x" << dumpAddress << ":";
+            for (uint32_t offset = 0u; offset < dumpSize && offset < 0x400u; offset += 4u)
+            {
+                const uint32_t physical = (dumpAddress + offset) & 0x1FFFFFFFu;
+                uint32_t value = 0u;
+                if (physical + sizeof(value) <= PS2_RAM_SIZE)
+                    std::memcpy(&value, rdram + physical, sizeof(value));
+                std::cerr << ((offset % 0x20u) == 0u ? "\n  " : " ") << value;
+            }
+            std::cerr << std::dec << std::endl;
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
@@ -1642,7 +1715,7 @@ void PS2Runtime::resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit)
     uint32_t limit = clampGuestHeapLimit(guestLimit);
     if (base == 0u)
     {
-        const uint32_t fallbackBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kGuestHeapDefaultBase;
+        const uint32_t fallbackBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kRuntimeGuestHeapBase;
         base = alignGuestHeapValue(clampGuestHeapBase(fallbackBase), kGuestHeapDefaultAlignment);
     }
 
@@ -1677,7 +1750,7 @@ void PS2Runtime::ensureGuestHeapInitializedLocked()
         return;
     }
 
-    const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kGuestHeapDefaultBase : m_guestHeapSuggestedBase;
+    const uint32_t suggested = (m_guestHeapSuggestedBase == 0u) ? kRuntimeGuestHeapBase : m_guestHeapSuggestedBase;
     resetGuestHeapLocked(suggested, clampGuestHeapLimit(0u));
 }
 
@@ -1810,7 +1883,7 @@ void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
     uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
     if (normalizedBase == 0u)
     {
-        normalizedBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kGuestHeapDefaultBase;
+        normalizedBase = (m_guestHeapSuggestedBase != 0u) ? m_guestHeapSuggestedBase : kRuntimeGuestHeapBase;
     }
     m_guestHeapSuggestedBase = normalizedBase;
     resetGuestHeapLocked(normalizedBase, guestLimit);

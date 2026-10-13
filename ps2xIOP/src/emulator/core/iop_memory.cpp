@@ -1,6 +1,7 @@
 #include "iop_memory.h"
 
 #include <algorithm>
+#include <vector>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -32,7 +33,7 @@ namespace ps2x::iop::detail
         std::fill(m_scratch.begin(), m_scratch.end(), uint8_t{0});
         m_hardware.clear();
         m_allocations.clear();
-        m_heapCursor = HeapBase;
+        m_moduleArenaEnd = HeapBase;
         m_interruptStatus = 0;
         m_interruptMask = 0;
         m_interruptControl = 1;
@@ -299,27 +300,26 @@ namespace ps2x::iop::detail
             return address;
         }
 
-        uint32_t candidate = alignUp(m_heapCursor, alignment);
+        // Top-down first fit: reuses released blocks and leaves the low end free for module images.
+        if (size > HeapLimit)
+            return 0u;
+        const uint32_t floor = std::max(HeapBase, m_moduleArenaEnd);
+        uint32_t candidate = (HeapLimit - size) & ~(alignment - 1u);
         for (;;)
         {
-            bool overlap = false;
-            for (const auto &block : m_allocations)
-            {
-                if (candidate < block.address + block.size && block.address < candidate + size)
-                {
-                    candidate = alignUp(block.address + block.size, alignment);
-                    overlap = true;
-                    break;
-                }
-            }
-            if (!overlap)
+            if (candidate < floor)
+                return 0u;
+            const auto overlap = std::find_if(m_allocations.begin(), m_allocations.end(),
+                                              [&](const Allocation &block)
+                                              { return candidate < block.address + block.size && block.address < candidate + size; });
+            if (overlap == m_allocations.end())
                 break;
+            if (overlap->address < size)
+                return 0u;
+            candidate = (overlap->address - size) & ~(alignment - 1u);
         }
-        if (candidate > HeapLimit || size > HeapLimit - candidate)
-            return 0u;
         m_allocations.push_back({candidate, size});
         markOwned(candidate, size);
-        m_heapCursor = std::max(m_heapCursor, candidate + size);
         return candidate;
     }
 
@@ -337,9 +337,32 @@ namespace ps2x::iop::detail
         return true;
     }
 
+    bool IopMemory::rangeAllocated(uint32_t address, uint32_t size) const noexcept
+    {
+        return std::any_of(m_allocations.begin(), m_allocations.end(), [&](const Allocation &block)
+                           { return address < block.address + block.size && block.address < address + size; });
+    }
+
     uint32_t IopMemory::maxFreeMemory() const
     {
-        return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
+        // Largest free gap in the heap, matching the first-fit allocator above.
+        std::vector<Allocation> blocks;
+        for (const auto &block : m_allocations)
+            if (block.address + block.size > HeapBase && block.address < HeapLimit)
+                blocks.push_back(block);
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b)
+                  { return a.address < b.address; });
+        uint32_t largest = 0u;
+        uint32_t cursor = std::max(HeapBase, m_moduleArenaEnd);
+        for (const auto &block : blocks)
+        {
+            if (block.address > cursor)
+                largest = std::max(largest, block.address - cursor);
+            cursor = std::max(cursor, block.address + block.size);
+        }
+        if (cursor < HeapLimit)
+            largest = std::max(largest, HeapLimit - cursor);
+        return largest;
     }
 
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const

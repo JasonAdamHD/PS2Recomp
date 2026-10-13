@@ -1,12 +1,14 @@
 #include "Common.h"
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
+#include "../Syscalls/Helpers/State.h"
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <vector>
 
@@ -289,6 +291,68 @@ namespace ps2_stubs
         }
     }
 
+    uint32_t findEeRpcServer(uint32_t sid) noexcept
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        const auto server = g_rpc_servers.find(sid);
+        return server != g_rpc_servers.end() ? server->second.sd_ptr : 0u;
+    }
+
+    bool callEeRpcServer(uint8_t *rdram,
+                         PS2Runtime *runtime,
+                         uint32_t sid,
+                         uint32_t rpcNumber,
+                         const std::vector<uint8_t> &send,
+                         uint32_t receiveSize,
+                         std::function<void(const uint8_t *, size_t)> onReply)
+    {
+        const uint32_t serverAddress = findEeRpcServer(sid);
+        if (!rdram || !runtime || serverAddress == 0u)
+            return false;
+
+        t_SifRpcServerData server{};
+        if (!readEeRange(rdram, serverAddress, &server, sizeof(server)) ||
+            server.func == 0u || !runtime->hasFunction(server.func))
+            return false;
+
+        // The server function sees the request in its own receive buffer, exactly as after a SIF DMA.
+        const uint32_t sendSize = static_cast<uint32_t>(send.size());
+        if (sendSize != 0u && (server.buf == 0u || !writeEeRange(rdram, server.buf, send.data(), sendSize)))
+            return false;
+
+        try
+        {
+            GuestInvocation invocation{};
+            invocation.kind = GuestInvocationKind::RpcCallback;
+            invocation.tag = sid;
+            invocation.context = runtime->cpu();
+            invocation.context.pc = server.func;
+            SET_GPR_U32(&invocation.context, 4, rpcNumber);
+            SET_GPR_U32(&invocation.context, 5, server.buf);
+            SET_GPR_U32(&invocation.context, 6, sendSize);
+            SET_GPR_U32(&invocation.context, 7, 0u);
+            SET_GPR_U32(&invocation.context, 29, 0u);
+            SET_GPR_U32(&invocation.context, 31, 0u);
+            invocation.onComplete = [rdram, receiveSize, onReply = std::move(onReply)](const R5900Context &completed, R5900Context &)
+            {
+                // The server returns the buffer the IOP client receives.
+                std::vector<uint8_t> reply(receiveSize, 0u);
+                const R5900Context *const completedContext = &completed;
+                const uint32_t replyAddress = GPR_U32(completedContext, 2);
+                if (replyAddress != 0u && receiveSize != 0u)
+                    (void)readEeRange(rdram, replyAddress, reply.data(), receiveSize);
+                if (onReply)
+                    onReply(reply.data(), reply.size());
+            };
+            runtime->eeScheduler().queueInvocation(std::move(invocation));
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void sceSifAddCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t cid = getRegU32(ctx, 4);
@@ -303,7 +367,9 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t reqSize = getRegU32(ctx, 4);
-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
+        const uint32_t address = runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u;
+        std::cerr << "[sceSifAllocIopHeap] size=0x" << std::hex << reqSize << " -> 0x" << address << std::dec << std::endl;
+        setReturnU32(ctx, address);
     }
 
     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

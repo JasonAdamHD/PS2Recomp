@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -22,7 +23,9 @@ namespace ps2x::iop::detail
         static constexpr uint32_t Spu2End = 0x1FA00000u;
         static constexpr uint32_t SifBase = 0x1D000000u;
         static constexpr uint32_t SifEnd = 0x1D001000u;
-        static constexpr uint32_t HeapBase = 0x00120000u;
+        // Modules load upward from HeapBase while heap blocks are carved top-down from HeapLimit,
+        // so both share the RAM between them as sysmem does on hardware.
+        static constexpr uint32_t HeapBase = 0x00010000u;
         static constexpr uint32_t HeapLimit = 0x001F0000u;
 
         struct Allocation
@@ -72,6 +75,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
+        [[nodiscard]] const std::vector<Allocation> &allocations() const noexcept { return m_allocations; }
+        [[nodiscard]] bool rangeAllocated(uint32_t address, uint32_t size) const noexcept;
+        void setModuleArenaEnd(uint32_t end) noexcept { m_moduleArenaEnd = std::max(m_moduleArenaEnd, end); }
+
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
@@ -82,7 +89,7 @@ namespace ps2x::iop::detail
         std::vector<uint8_t> m_scratch;
         std::unordered_map<uint32_t, uint32_t> m_hardware;
         std::vector<Allocation> m_allocations;
-        uint32_t m_heapCursor = HeapBase;
+        uint32_t m_moduleArenaEnd = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;

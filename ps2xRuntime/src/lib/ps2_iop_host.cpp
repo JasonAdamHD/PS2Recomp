@@ -517,6 +517,23 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
                                          packetSize);
 }
 
+bool PS2IopHostAdapter::hasEeRpcServer(uint32_t sid)
+{
+    return ps2_stubs::findEeRpcServer(sid) != 0u;
+}
+
+bool PS2IopHostAdapter::callEeRpc(uint32_t sid,
+                                  uint32_t rpcNumber,
+                                  const std::vector<uint8_t> &send,
+                                  uint32_t receiveSize,
+                                  std::function<void(const uint8_t *, size_t)> onReply)
+{
+    uint8_t *const rdram = m_activeRdram
+                               ? m_activeRdram
+                               : m_runtime.memory().getRDRAM();
+    return ps2_stubs::callEeRpcServer(rdram, &m_runtime, sid, rpcNumber, send, receiveSize, std::move(onReply));
+}
+
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 {
     const char *prefix = "[ps2xIOP]";

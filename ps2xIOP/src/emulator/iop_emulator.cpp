@@ -17,6 +17,10 @@
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 
+#include <chrono>
+#include <vector>
+#include <cstdio>
+#include <set>
 #include <algorithm>
 #include <cctype>
 #include <map>
@@ -36,7 +40,18 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackLimit = 0x001FFF00u;
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
-        constexpr uint64_t kCdvdCompletionCycles = 128u;
+        // The Atlas stream driver polls slot state from the EE between CD commands, so reads must
+        // take roughly as long as on hardware: a seek plus the DVD transfer time per 2 KB sector.
+        constexpr uint64_t kCdvdSeekCycles = kIopClockHz / 500u;     // ~2 ms
+        constexpr uint64_t kCdvdSectorCycles = kIopClockHz / 2700u;  // ~0.37 ms per sector at 4x DVD
+        constexpr uint32_t kCdvdReadOrdinal = 6u;
+
+        std::string toHex(uint32_t value)
+        {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%x", value);
+            return text;
+        }
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -237,9 +252,31 @@ namespace ps2x::iop::detail
             Missing,
         };
 
+        // Logs every distinct library:ordinal that ends up Missing (several library paths returned Missing
+        // silently, which hid unimplemented thread/semaphore/event/SIF imports).
         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
         {
+            const ImportDisposition disposition = dispatchImportInner(call, cpu);
+            if (disposition == ImportDisposition::Missing)
+            {
+                std::string key(call.library);
+                key += ':';
+                key += std::to_string(call.ordinal);
+                if (loggedMissingImports.insert(key).second)
+                {
+                    std::ostringstream out;
+                    out << "[IOP] missing import " << key << " version=0x" << std::hex << call.version
+                        << " pc=0x" << cpu.pc << " ra=0x" << cpu.gpr[31];
+                    log(LogLevel::Warning, out.str());
+                }
+            }
+            return disposition;
+        }
+
+        ImportDisposition dispatchImportInner(const IopImportCall &call, CpuState &cpu)
+        {
             const uint32_t a0 = cpu.gpr[4];
+            const uint32_t a1 = cpu.gpr[5];
             auto setV0 = [&](uint32_t value)
             {
                 cpu.gpr[2] = value;
@@ -252,8 +289,9 @@ namespace ps2x::iop::detail
             {
                 if (const auto callback = cdvd.takeCompletionCallback())
                 {
+                    const uint64_t sectors = call.ordinal == kCdvdReadOrdinal ? a1 : 0u;
                     pendingGuestCallbacks.emplace(
-                        totalCycles + kCdvdCompletionCycles,
+                        totalCycles + kCdvdSeekCycles + sectors * kCdvdSectorCycles,
                         ScheduledGuestCallback{
                             callback->address,
                             callback->gp,
@@ -553,6 +591,10 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        std::chrono::steady_clock::time_point nextThreadDump{};
+        std::map<uint32_t, uint64_t> slicePcHistogram;
+        uint32_t threadDumpCount = 0;
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -560,6 +602,36 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    if (std::chrono::steady_clock::now() >= nextThreadDump)
+                    {
+                        nextThreadDump = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                        log(LogLevel::Info, "[IOP:threads] cycles=" + std::to_string(totalCycles) + kernel.describeThreads());
+                        std::vector<std::pair<uint64_t, uint32_t>> hot;
+                        for (const auto &[pc, count] : slicePcHistogram)
+                            hot.emplace_back(count, pc);
+                        std::sort(hot.rbegin(), hot.rend());
+                        std::string hotText = "[IOP:hotpc]";
+                        for (size_t i = 0; i < hot.size() && i < 24u; ++i)
+                        {
+                            char entry[48];
+                            std::snprintf(entry, sizeof(entry), " %x:%llu", hot[i].second, static_cast<unsigned long long>(hot[i].first));
+                            hotText += entry;
+                        }
+                        log(LogLevel::Info, hotText);
+                        slicePcHistogram.clear();
+                        if (++threadDumpCount == 3u)
+                        {
+                            std::vector<uint8_t> ram(0x200000u);
+                            if (memory.readRam(0u, ram.data(), ram.size()))
+                            {
+                                if (FILE *file = std::fopen("iop_ram.bin", "wb"))
+                                {
+                                    std::fwrite(ram.data(), 1u, ram.size(), file);
+                                    std::fclose(file);
+                                }
+                            }
+                        }
+                    }
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -577,6 +649,7 @@ namespace ps2x::iop::detail
                     }
                     const uint64_t before = totalCycles;
                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    ++slicePcHistogram[next->cpu.pc];
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
@@ -654,8 +727,11 @@ namespace ps2x::iop::detail
 
         ModuleLoadResult loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
         {
+            // On hardware the buffer lives in IOP RAM (the EE allocates it with sceSifAllocSysMemory and
+            // DMAs the IRX there with sceSifSetDma). Fall back to EE RAM for callers that pass an EE pointer.
             std::vector<uint8_t> image;
-            if (!IopModuleLoader::readElfFromGuest(host, guestAddress, image))
+            if (!IopModuleLoader::readElfFromIop(memory, guestAddress, image) &&
+                !IopModuleLoader::readElfFromGuest(host, guestAddress, image))
                 return {true, -1, -1};
             std::ostringstream tag;
             tag << "buffer@0x" << std::hex << guestAddress;
@@ -695,6 +771,7 @@ namespace ps2x::iop::detail
         IopImportRegistry imports;
         IopLoadcore loadcore;
         std::map<int, Module> modules;
+        std::set<std::string> loggedMissingImports;
         std::map<int, uint64_t> pendingDmaInterrupts;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
@@ -765,7 +842,15 @@ namespace ps2x::iop::detail
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
-        return m_impl->memory.allocate(size, alignment);
+        const uint32_t address = m_impl->memory.allocate(size, alignment);
+        if (address == 0u)
+        {
+            std::string text = "[IOP] heap allocation of 0x" + toHex(size) + " failed; blocks:";
+            for (const auto &block : m_impl->memory.allocations())
+                text += " " + toHex(block.address) + "+" + toHex(block.size);
+            m_impl->log(LogLevel::Warning, text);
+        }
+        return address;
     }
 
     bool IopEmulator::freeMemory(uint32_t address)

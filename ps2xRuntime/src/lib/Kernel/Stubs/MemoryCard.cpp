@@ -905,7 +905,8 @@ namespace ps2_stubs
             }
         }
 
-        RUNTIME_LOG("[MC] GetInfo port=" << port << " type=" << cardType
+        RUNTIME_LOG("[MC] GetInfo port=" << port << " slot=" << slot << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec
+                                         << " type=" << cardType
                                          << " free=" << freeBlocks << " format=" << format
                                          << " result=" << result);
         setReturnS32(ctx, 0);

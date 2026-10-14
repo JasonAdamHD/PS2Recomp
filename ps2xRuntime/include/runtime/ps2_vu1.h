@@ -203,12 +203,16 @@ private:
     Unit m_unit;
     VU1State m_state;
     std::array<DecodedInstructionPair, kMaxDecodedPairs> m_decodedCodeCache{};
+    // Code generation + 1 each cached pair was decoded at (0 = never); pairs are re-decoded lazily on use.
+    std::array<uint64_t, kMaxDecodedPairs> m_decodedPairGeneration{};
     const uint8_t *m_cachedVuCode = nullptr;
     const PS2Memory *m_cachedMemory = nullptr;
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
 
+    // Earliest readyCycle among queued pipeline entries; commitReadyPipelines() skips its scans before it.
+    uint64_t m_nextCommitCycle = 0;
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};

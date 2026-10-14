@@ -1,3 +1,6 @@
+#include <string>
+#include <chrono>
+#include <deque>
 #include "iop_rpc.h"
 
 #include "../core/iop_cpu.h"
@@ -357,10 +360,40 @@ namespace ps2x::iop::detail
         }
     }
 
+    namespace
+    {
+        // PS2X_ATCMD_RING=1: keep the last 64 Atlas IO commands/replies in memory and print them every 30 s.
+        // Unlike streaming them to the log, this barely changes timing (the load stall it is for hides when logged).
+        bool atRingEnabled()
+        {
+            static const bool enabled = std::getenv("PS2X_ATCMD_RING") != nullptr;
+            return enabled;
+        }
+
+        void atRingPush(std::string text)
+        {
+            static std::deque<std::string> ring;
+            static auto lastDump = std::chrono::steady_clock::now();
+            static uint64_t sequence = 0u;
+            ring.push_back(std::to_string(++sequence) + " " + std::move(text));
+            if (ring.size() > 64u)
+                ring.pop_front();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastDump >= std::chrono::seconds(30))
+            {
+                lastDump = now;
+                std::string dump = "[IOP:atring]";
+                for (const std::string &line : ring)
+                    dump += "\n  " + line;
+                std::fprintf(stderr, "%s\n", dump.c_str());
+            }
+        }
+    }
+
     void IopRpcBridge::logCommandPacket(uint32_t sid, const std::vector<uint8_t> &payload)
     {
         // Decodes the Atlas IO packet (0x48, count, {id, argc, args...}) so new EE requests show up in the log.
-        static const bool enabled = std::getenv("PS2X_IOP_LOG") != nullptr;
+        static const bool enabled = std::getenv("PS2X_IOP_LOG") != nullptr || std::getenv("PS2X_ATCMD_LOG") != nullptr || atRingEnabled();
         if (!enabled || sid != 0x12345u || payload.size() < 4u)
             return;
         const auto half = [&](size_t index) -> uint16_t
@@ -391,9 +424,14 @@ namespace ps2x::iop::detail
         if (text == m_lastCommandText)
             return;
         m_lastCommandText = text;
+        if (atRingEnabled())
+        {
+            atRingPush("cmd" + text);
+            return;
+        }
         static uint32_t logged = 0u;
         if (++logged <= 3000u)
-            m_host.log(LogLevel::Info, "[IOP:atcmd]" + text);
+            m_host.log(std::getenv("PS2X_ATCMD_LOG") ? LogLevel::Warning : LogLevel::Info, "[IOP:atcmd]" + text);
     }
 
     RpcResult IopRpcBridge::handleRpc(const RpcRequest &request, IopGuestExecutor &executor)
@@ -438,7 +476,7 @@ namespace ps2x::iop::detail
             }
         }
 
-        static const bool logReplies = std::getenv("PS2X_IOP_LOG") != nullptr;
+        static const bool logReplies = std::getenv("PS2X_IOP_LOG") != nullptr || std::getenv("PS2X_ATCMD_LOG") != nullptr || atRingEnabled();
         if (logReplies && request.sid == 0x12345u && returnPointer != 0u)
         {
             // Reply layout: word0 = record count | flags << 8, then 9-word slot records, then a status tail.
@@ -459,9 +497,15 @@ namespace ps2x::iop::detail
             if (text != m_lastReplyText)
             {
                 m_lastReplyText = text;
+                if (atRingEnabled())
+                {
+                    atRingPush("reply n=" + std::to_string(records) + text);
+                }
                 static uint32_t logged = 0u;
+                if (atRingEnabled())
+                    logged = 3000u;
                 if (++logged <= 3000u)
-                    m_host.log(LogLevel::Info, "[IOP:atreply] n=" + std::to_string(records) + text);
+                    m_host.log(std::getenv("PS2X_ATCMD_LOG") ? LogLevel::Warning : LogLevel::Info, "[IOP:atreply] n=" + std::to_string(records) + text);
             }
         }
 

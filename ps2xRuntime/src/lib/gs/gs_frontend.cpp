@@ -774,7 +774,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 }
 
 bool ps2ProfileEnabled();
-extern std::atomic<uint64_t> g_ps2ProfileNanos[4];
+extern std::atomic<uint64_t> g_ps2ProfileNanos[8];
 
 std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const
 {

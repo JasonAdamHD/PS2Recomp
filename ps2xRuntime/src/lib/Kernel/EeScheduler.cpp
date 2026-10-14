@@ -12,6 +12,9 @@
 #include <limits>
 #include <stdexcept>
 
+extern bool g_ps2BranchDeferred; // ps2_runtime.cpp
+extern std::atomic<const R5900Context *> g_ps2SampleContext; // ps2_runtime.cpp, PS2X_SAMPLE_PCS
+
 namespace
 {
     constexpr int KE_OK = 0;
@@ -307,10 +310,45 @@ void EeScheduler::run()
             continue;
         }
 
+        // PS2X_CHECK_RESUME=1: a context must come back to the dispatcher with the callee-saved registers it left with.
+        static const bool checkResume = std::getenv("PS2X_CHECK_RESUME") != nullptr;
+        struct ResumeSnapshot
+        {
+            uint32_t pc = 0u;
+            uint32_t regs[10] = {};
+        };
+        static std::unordered_map<uint64_t, ResumeSnapshot> resumeSnapshots;
+        static constexpr int kCheckedRegs[10] = {16, 17, 18, 19, 20, 21, 22, 23, 29, 30};
+        const int checkThreadId = running->id;
+        if (checkResume)
+        {
+            const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(checkThreadId)) << 8u) | running->invocations.size();
+            const auto found = resumeSnapshots.find(key);
+            if (found != resumeSnapshots.end() && found->second.pc != 0u)
+            {
+                static uint32_t reports = 0u;
+                for (int i = 0; i < 10 && reports < 100u; ++i)
+                {
+                    const uint32_t now = getRegU32(&context, kCheckedRegs[i]);
+                    if (now != found->second.regs[i])
+                    {
+                        ++reports;
+                        std::cerr << "[resume-check] thread " << checkThreadId << " depth " << running->invocations.size()
+                                  << std::hex << " left at pc 0x" << found->second.pc << " resumed at pc 0x" << context.pc
+                                  << " r" << std::dec << kCheckedRegs[i] << std::hex << " 0x" << found->second.regs[i]
+                                  << " -> 0x" << now << std::dec << std::endl;
+                    }
+                }
+                resumeSnapshots.erase(found);
+            }
+        }
+
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
             m_guestExecuting.store(true, std::memory_order_release);
+            g_ps2BranchDeferred = false;
+            g_ps2SampleContext.store(&context, std::memory_order_relaxed);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
@@ -326,6 +364,18 @@ void EeScheduler::run()
             m_running.store(false, std::memory_order_release);
             publishSnapshot();
             throw;
+        }
+        if (checkResume)
+        {
+            if (GuestThread *left = thread(checkThreadId))
+            {
+                const R5900Context &leftContext = left->activeContext();
+                ResumeSnapshot snapshot;
+                snapshot.pc = leftContext.pc;
+                for (int i = 0; i < 10; ++i)
+                    snapshot.regs[i] = getRegU32(&leftContext, kCheckedRegs[i]);
+                resumeSnapshots[(static_cast<uint64_t>(static_cast<uint32_t>(checkThreadId)) << 8u) | left->invocations.size()] = snapshot;
+            }
         }
 
         processPendingEvents();
@@ -2198,7 +2248,7 @@ void EeScheduler::publishIdleDebugContext()
 }
 
 bool ps2ProfileEnabled();
-extern std::atomic<uint64_t> g_ps2ProfileNanos[4];
+extern std::atomic<uint64_t> g_ps2ProfileNanos[8];
 SchedulerWaitScope::SchedulerWaitScope()
     : active(ps2ProfileEnabled()), start(active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{})
 {

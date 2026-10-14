@@ -1,3 +1,4 @@
+#include <chrono>
 #include "runtime/ps2_vu1.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
@@ -533,6 +534,7 @@ void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest,
     entry->valid = true;
     entry->issueCycle = m_cycle;
     entry->readyCycle = m_cycle + kFmacLatency;
+    m_nextCommitCycle = std::min(m_nextCommitCycle, entry->readyCycle);
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -572,6 +574,7 @@ void VU1Interpreter::queueFsset(uint16_t immediate)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
             entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
             entry.writesSticky = true;
             return;
@@ -591,6 +594,7 @@ void VU1Interpreter::queueClip(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -615,6 +619,7 @@ void VU1Interpreter::queueFcset(uint32_t clip)
             entry.valid = true;
             entry.issueCycle = m_cycle;
             entry.readyCycle = m_cycle + kFmacLatency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
             entry.clip = m_workingClip;
             entry.writesClip = true;
             return;
@@ -629,6 +634,7 @@ void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
     value = normalizeResult(value, ignoredFlags);
     m_fdiv.valid = true;
     m_fdiv.readyCycle = m_cycle + latency;
+    m_nextCommitCycle = std::min(m_nextCommitCycle, m_fdiv.readyCycle);
     m_fdiv.value = value;
     m_fdiv.statusDi = statusDi & 0x30u;
 }
@@ -643,6 +649,7 @@ void VU1Interpreter::queueP(float value, uint32_t latency)
         {
             entry.valid = true;
             entry.readyCycle = m_cycle + latency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, entry.readyCycle);
             entry.value = value;
             // EFU throughput is one cycle shorter than result visibility.
             m_efuResourceReady = m_cycle + (latency > 0u ? latency - 1u : 0u);
@@ -660,6 +667,7 @@ void VU1Interpreter::queueStore(uint32_t address, const uint32_t words[4], uint8
         {
             store.valid = true;
             store.readyCycle = m_cycle + 1u;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, store.readyCycle);
             store.address = address;
             store.laneMask = laneMask;
             std::copy(words, words + 4, store.words.begin());
@@ -681,6 +689,7 @@ void VU1Interpreter::queueVfWrite(uint8_t reg, uint8_t laneMask,
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.laneMask = laneMask;
@@ -707,6 +716,7 @@ void VU1Interpreter::queueViWrite(uint8_t reg, int32_t value, uint32_t latency)
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.reg = reg;
             write.value = value;
@@ -728,6 +738,7 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
             write = {};
             write.valid = true;
             write.readyCycle = m_cycle + latency;
+            m_nextCommitCycle = std::min(m_nextCommitCycle, write.readyCycle);
             write.sequence = ++m_nextWriteSequence;
             write.laneMask = laneMask;
             std::copy(value, value + 4, write.value.begin());
@@ -744,6 +755,38 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 
 void VU1Interpreter::commitReadyPipelines()
 {
+    if (m_cycle < m_nextCommitCycle)
+        return;
+    struct NextCommitUpdate
+    {
+        VU1Interpreter &vu;
+        ~NextCommitUpdate()
+        {
+            // Recompute the earliest pending entry for the next early-out.
+            uint64_t next = std::numeric_limits<uint64_t>::max();
+            for (const auto &entry : vu.m_flagPipeline)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            if (vu.m_fdiv.valid)
+                next = std::min(next, vu.m_fdiv.readyCycle);
+            for (const auto &entry : vu.m_efu)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            for (const auto &entry : vu.m_storePipeline)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            for (const auto &entry : vu.m_vfWritePipeline)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            for (const auto &entry : vu.m_viWritePipeline)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            for (const auto &entry : vu.m_accWritePipeline)
+                if (entry.valid)
+                    next = std::min(next, entry.readyCycle);
+            vu.m_nextCommitCycle = next;
+        }
+    } nextCommitUpdate{*this};
     for (FlagPipelineEntry &entry : m_flagPipeline)
     {
         if (!entry.valid || entry.readyCycle > m_cycle)
@@ -939,8 +982,32 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
     m_xgkick.issueCycle = m_cycle;
 }
 
+namespace
+{
+    // PS2X_PROFILE_TIME: VU1 volume counters (instruction pairs, stall cycles, runs), printed every 5 s.
+    uint64_t g_vuPairs = 0, g_vuStallCycles = 0, g_vuRuns = 0, g_vuBudgetHits = 0;
+    bool vuStatsEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_PROFILE_TIME") != nullptr;
+        return enabled;
+    }
+    void reportVuStats()
+    {
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - last).count();
+        if (elapsed < 5.0)
+            return;
+        std::fprintf(stderr, "[vu1-stats] runs=%.0f/s pairs=%.0f/s stallCycles=%.0f/s budgetHits=%.0f/s\n", g_vuRuns / elapsed,
+                     g_vuPairs / elapsed, g_vuStallCycles / elapsed, g_vuBudgetHits / elapsed);
+        g_vuPairs = g_vuStallCycles = g_vuRuns = g_vuBudgetHits = 0;
+        last = now;
+    }
+}
+
 void VU1Interpreter::advanceOneCycle()
 {
+    ++g_vuStallCycles;
     ++m_cycle;
     m_state.cycles = m_cycle;
     // LSU commits become visible at the cycle boundary before PATH1 consumes
@@ -1561,14 +1628,24 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     if (!m_decodedCodeCacheValid ||
         m_cachedVuCode != vuCode ||
         m_cachedMemory != memory ||
-        m_cachedCodeSize != codeSize ||
-        m_cachedCodeGeneration != generation)
+        m_cachedCodeSize != codeSize)
     {
-        rebuildDecodedCodeCache(vuCode, codeSize, memory, generation);
+        m_decodedPairGeneration.fill(0u);
+        m_cachedVuCode = vuCode;
+        m_cachedMemory = memory;
+        m_cachedCodeSize = codeSize;
+        m_decodedCodeCacheValid = true;
     }
+    m_cachedCodeGeneration = generation;
     const uint32_t pairIndex = pc / 8u;
-    if (pairIndex >= kMaxDecodedPairs)
+    if (pairIndex >= kMaxDecodedPairs || pc + 8u > codeSize)
         return decodeInstructionPair(vuCode, pc);
+    // Decode lazily: a microcode upload invalidates every pair, but only the pairs that run are decoded again.
+    if (m_decodedPairGeneration[pairIndex] != generation + 1u)
+    {
+        m_decodedCodeCache[pairIndex] = decodeInstructionPair(vuCode, pc);
+        m_decodedPairGeneration[pairIndex] = generation + 1u;
+    }
     return m_decodedCodeCache[pairIndex];
 }
 
@@ -1633,12 +1710,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool useVuRounding = std::fesetround(FE_TOWARDZERO) == 0;
     const uint64_t budgetEnd = m_cycle + maxCycles;
     bool programEnded = false;
+    const bool vuStats = vuStatsEnabled();
+    if (vuStats)
+    {
+        ++g_vuRuns;
+        reportVuStats();
+    }
     while (m_cycle < budgetEnd && !m_stopRequested)
     {
         commitReadyPipelines();
         if (m_state.pc + 8u > codeSize)
             break;
 
+        ++g_vuPairs;
         const DecodedInstructionPair decoded = getDecodedInstructionPairForPc(vuCode, codeSize, memory, m_state.pc);
         if (decoded.upperUsage.reserved || decoded.lowerUsage.reserved)
         {
@@ -1824,6 +1908,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             break;
     }
 
+    if (!programEnded && m_cycle >= budgetEnd)
+        ++g_vuBudgetHits;
     if (programEnded)
     {
         flushPipelines();

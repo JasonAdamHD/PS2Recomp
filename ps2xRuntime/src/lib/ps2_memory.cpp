@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <chrono>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
@@ -1660,8 +1662,32 @@ void PS2Memory::completeDmacChannel(uint32_t channelBase, uint32_t cause)
     queueCompletedDmacCause(cause);
 }
 
+namespace
+{
+    bool ps2MemProfileEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_PROFILE_TIME") != nullptr || std::getenv("PS2X_PROFILE_ALL") != nullptr;
+        return enabled;
+    }
+    struct MemProfileScope
+    {
+        int slot;
+        bool active = ps2MemProfileEnabled();
+        std::chrono::steady_clock::time_point start = active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        explicit MemProfileScope(int s) : slot(s) {}
+        ~MemProfileScope();
+    };
+}
+extern std::atomic<uint64_t> g_ps2ProfileNanos[8];
+MemProfileScope::~MemProfileScope()
+{
+    if (active)
+        g_ps2ProfileNanos[slot].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    MemProfileScope pendingScope(6);
     const bool hadGif = !m_pendingGifTransfers.empty();
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)

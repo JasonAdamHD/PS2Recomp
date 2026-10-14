@@ -33,6 +33,8 @@
 #include <unordered_map>
 #include <sstream>
 
+extern bool g_ps2BranchDeferred; // defined with PS2Runtime::eeCheckpointDue
+
 namespace
 {
     // COP0 Count runs at the EE core clock (294.912 MHz). It is derived from the host clock so
@@ -201,6 +203,43 @@ namespace
         {
             h.wrapped = true;
         }
+    }
+
+    // PS2X_REG_TRACE=1: ring of dispatched calls with s1/a0/a1/sp on entry and on return, dumped on a bad branch.
+    struct RegTraceEntry
+    {
+        char phase = 0; // 'c' call, 'r' returned normally, 'u' unwound
+        uint32_t source = 0u, target = 0u, s1 = 0u, a0 = 0u, a1 = 0u, sp = 0u;
+    };
+    std::array<RegTraceEntry, 96> g_regTrace{};
+    uint32_t g_regTraceNext = 0u;
+
+    bool regTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_REG_TRACE") != nullptr;
+        return enabled;
+    }
+
+    void regTraceRecord(char phase, uint32_t source, uint32_t target, const R5900Context *ctx)
+    {
+        RegTraceEntry &entry = g_regTrace[g_regTraceNext++ % g_regTrace.size()];
+        entry = {phase, source, target, static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0)),
+                 static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0)), static_cast<uint32_t>(_mm_extract_epi32(ctx->r[5], 0)),
+                 static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0))};
+    }
+
+    void regTraceDump()
+    {
+        std::cerr << "[reg-trace] oldest first:" << std::hex << std::endl;
+        for (uint32_t i = 0; i < g_regTrace.size(); ++i)
+        {
+            const RegTraceEntry &e = g_regTrace[(g_regTraceNext + i) % g_regTrace.size()];
+            if (e.phase == 0)
+                continue;
+            std::cerr << "  " << e.phase << " 0x" << e.source << "->0x" << e.target << " s1=0x" << e.s1 << " a0=0x" << e.a0
+                      << " a1=0x" << e.a1 << " sp=0x" << e.sp << std::endl;
+        }
+        std::cerr << std::dec;
     }
 
     std::string formatDispatchHistory()
@@ -415,10 +454,11 @@ namespace
 }
 
 // PS2X_PROFILE_ALL=1: wall time spent in heavy native subsystems, reported with the call profile.
-std::atomic<uint64_t> g_ps2ProfileNanos[4]{};
+std::atomic<uint64_t> g_ps2ProfileNanos[8]{};
 bool ps2ProfileEnabled()
 {
-    static const bool enabled = std::getenv("PS2X_PROFILE_ALL") != nullptr;
+    // PS2X_PROFILE_TIME=1 measures only these subsystem times (cheap), without PS2X_PROFILE_ALL's call counting.
+    static const bool enabled = std::getenv("PS2X_PROFILE_ALL") != nullptr || std::getenv("PS2X_PROFILE_TIME") != nullptr;
     return enabled;
 }
 struct Ps2ProfileScope
@@ -838,6 +878,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     Ps2ProfileScope vu1Scope(1);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
@@ -1350,6 +1391,8 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
                                        GuestBranchKind kind,
                                        const char *debugName)
 {
+    if (regTraceEnabled())
+        regTraceDump();
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
     if (heapTraceEnabled())
@@ -1518,6 +1561,110 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
+#ifdef PS2X_WRITE_WATCH
+uint32_t g_ps2WatchCount = 0u;
+uint32_t g_ps2WatchAddrs[16] = {};
+uint32_t g_ps2WatchPoolBase = 0u, g_ps2WatchPoolStride = 1u, g_ps2WatchPoolCount = 0u, g_ps2WatchPoolRem = 0u;
+namespace
+{
+    const bool g_watchPoolParsed = []
+    {
+        if (const char *spec = std::getenv("PS2X_WATCH_POOL"))
+        {
+            char *end = nullptr;
+            g_ps2WatchPoolBase = static_cast<uint32_t>(std::strtoul(spec, &end, 16));
+            g_ps2WatchPoolStride = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+            g_ps2WatchPoolCount = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+            g_ps2WatchPoolRem = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+            if (g_ps2WatchPoolStride == 0u)
+                g_ps2WatchPoolCount = 0u, g_ps2WatchPoolStride = 1u;
+        }
+        return true;
+    }();
+}
+
+void ps2WatchHit(uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx)
+{
+    static uint32_t hits = 0u;
+    if (++hits > 400u)
+        return;
+    std::cerr << "[watch] write addr=0x" << std::hex << guestAddr << " size=" << std::dec << size << " value=0x" << std::hex
+              << valueLo << " pc=0x" << (ctx ? ctx->pc : 0u) << " ra=0x"
+              << (ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u) << " sp=0x"
+              << (ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u) << std::dec
+              << " trace=" << formatDispatchHistory() << std::endl;
+}
+
+namespace
+{
+    // PS2X_WATCH_ARM=<spec>[;<spec>...], spec = [t]<hex pc>:<reg>+<hex off>[,<hex off>...]. Arms word watchpoints at
+    // reg+off whenever a dispatched call comes from that pc (or, with the t prefix, goes to it).
+    // e.g. 50e674:17+0,56c,450 watches each Flash level's list link, context and vtable.
+    struct WatchArmSpec
+    {
+        bool byTarget = false;
+        uint32_t pc = 0u, reg = 0u;
+        std::vector<uint32_t> offsets;
+    };
+
+    const std::vector<WatchArmSpec> &watchArmSpecs()
+    {
+        static const std::vector<WatchArmSpec> specs = []
+        {
+            std::vector<WatchArmSpec> out;
+            const char *text = std::getenv("PS2X_WATCH_ARM");
+            while (text && *text)
+            {
+                WatchArmSpec spec;
+                if (*text == 't')
+                {
+                    spec.byTarget = true;
+                    ++text;
+                }
+                char *end = nullptr;
+                spec.pc = static_cast<uint32_t>(std::strtoul(text, &end, 16));
+                if (*end != ':')
+                    break;
+                spec.reg = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+                while (*end == '+' || *end == ',')
+                    spec.offsets.push_back(static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)));
+                out.push_back(spec);
+                text = (*end == ';') ? end + 1 : nullptr;
+            }
+            return out;
+        }();
+        return specs;
+    }
+
+    void maybeArmWriteWatch(R5900Context *ctx, uint32_t sourcePc, uint32_t targetPc)
+    {
+        for (const WatchArmSpec &spec : watchArmSpecs())
+        {
+            if ((spec.byTarget ? targetPc : sourcePc) != spec.pc)
+                continue;
+            const uint32_t base = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[spec.reg & 31u], 0));
+            for (uint32_t offset : spec.offsets)
+            {
+                const uint32_t word = ((base + offset) & PS2_RAM_MASK) & ~3u;
+                bool known = false;
+                for (uint32_t i = 0; i < g_ps2WatchCount; ++i)
+                    known |= g_ps2WatchAddrs[i] == word;
+                if (known)
+                    continue;
+                if (g_ps2WatchCount == 16u)
+                {
+                    std::memmove(g_ps2WatchAddrs, g_ps2WatchAddrs + 1, 15u * sizeof(uint32_t));
+                    --g_ps2WatchCount;
+                }
+                g_ps2WatchAddrs[g_ps2WatchCount++] = word;
+                std::cerr << "[watch] armed 0x" << std::hex << word << " (base 0x" << base << " pc 0x" << spec.pc << ")"
+                          << std::dec << std::endl;
+            }
+        }
+    }
+}
+#endif
+
 bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
@@ -1528,6 +1675,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 {
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
+#ifdef PS2X_WRITE_WATCH
+    maybeArmWriteWatch(ctx, sourcePc, targetPc);
+#endif
 
     // Debug aid: PS2X_DUMP_AT=<hex pc> PS2X_DUMP_RANGE=<hex addr>:<hex size> prints guest memory
     // each time a call reaches that pc (first 8 hits).
@@ -1576,6 +1726,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        g_ps2BranchDeferred = true;
         return false;
     }
 
@@ -1707,7 +1858,40 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 g_heapLiveSizes.erase(live);
         }
     }
+    const bool traceRegs = regTraceEnabled() && isCall;
+    if (traceRegs)
+        regTraceRecord('c', sourcePc, targetPc, ctx);
+#ifdef PS2X_WRITE_WATCH
+    // PS2X_CHECK_SREGS=1: callee-saved registers (s0-s7, sp, fp) must survive a call that returns normally.
+    static const bool checkSregs = std::getenv("PS2X_CHECK_SREGS") != nullptr;
+    uint32_t savedRegs[10] = {};
+    static constexpr int kSavedRegIndex[10] = {16, 17, 18, 19, 20, 21, 22, 23, 29, 30};
+    if (checkSregs && isCall)
+        for (int i = 0; i < 10; ++i)
+            savedRegs[i] = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[kSavedRegIndex[i]], 0));
+#endif
     targetFn(rdram, ctx, this);
+#ifdef PS2X_WRITE_WATCH
+    // Recursive calls (caller and callee in the same function) can "return" through an inner frame; skip them.
+    if (checkSregs && isCall && (ctx->pc == fallthroughPc || ctx->pc == entryPc) && !isStopRequested() &&
+        lookupFunction(sourcePc) != lookupFunction(targetPc))
+    {
+        static uint32_t reports = 0u;
+        for (int i = 0; i < 10 && reports < 200u; ++i)
+        {
+            const uint32_t now = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[kSavedRegIndex[i]], 0));
+            if (now != savedRegs[i])
+            {
+                ++reports;
+                std::cerr << "[sregs] call 0x" << std::hex << sourcePc << " -> 0x" << targetPc << " returned with r"
+                          << std::dec << kSavedRegIndex[i] << std::hex << " 0x" << savedRegs[i] << " -> 0x" << now
+                          << std::dec << " trace=" << formatDispatchHistory() << std::endl;
+            }
+        }
+    }
+#endif
+    if (traceRegs)
+        regTraceRecord(ctx->pc == fallthroughPc || ctx->pc == entryPc ? 'r' : 'u', sourcePc, targetPc, ctx);
     if (traceHeap && targetPc == kHeapAllocPc)
     {
         const uint32_t ptr = getRegU32(ctx, 2);
@@ -1738,7 +1922,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
     }
 
-    if (isStopRequested() || ctx->pc == 0u)
+    if (g_ps2BranchDeferred || isStopRequested() || ctx->pc == 0u)
     {
         return false;
     }
@@ -2450,7 +2634,9 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
+        Ps2ProfileScope storeScope(4);
         m_memory.write32(vaddr, value);
+        Ps2ProfileScope dmacScope(7);
         drainCompletedDmacHandlers(rdram);
     }
     catch (const std::exception &)
@@ -2551,9 +2737,19 @@ void PS2Runtime::postEeEvent(EeEvent event)
     m_eeScheduler->postEvent(event);
 }
 
+// Set when a safe point defers execution: generated code then unwinds by plain returns with ctx->pc at the next
+// guest instruction, and the scheduler resumes there. While it is set, no dispatch may treat its callee as
+// having returned. Without this, a deferred call to the same function as an enclosing frame (recursion) left
+// ctx->pc equal to that frame's entry, which the "pc == entry means returned" rule took for a normal return:
+// the enclosing call was abandoned without its epilogue, leaving callee-saved registers and sp unrestored.
+bool g_ps2BranchDeferred = false;
+
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    const bool due = m_eeScheduler->checkpointDue(cycles);
+    if (due)
+        g_ps2BranchDeferred = true;
+    return due;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2681,6 +2877,46 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+// PS2X_SAMPLE_PCS=1: a host thread samples the guest pc of the running EE context 5000 times a second and prints
+// the 40 hottest pcs every 5 seconds (resolve them to functions with map.csv).
+std::atomic<const R5900Context *> g_ps2SampleContext{nullptr};
+
+namespace
+{
+    void runPcSampler(const std::atomic<bool> &stop)
+    {
+        std::unordered_map<uint32_t, uint32_t> counts;
+        auto lastReport = std::chrono::steady_clock::now();
+        uint32_t total = 0u;
+        while (!stop.load(std::memory_order_relaxed))
+        {
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            if (const R5900Context *context = g_ps2SampleContext.load(std::memory_order_relaxed))
+            {
+                const uint32_t pc = *reinterpret_cast<const volatile uint32_t *>(&context->pc);
+                ++counts[pc];
+                ++total;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastReport >= std::chrono::seconds(5))
+            {
+                std::vector<std::pair<uint32_t, uint32_t>> ranked;
+                for (const auto &[pc, count] : counts)
+                    ranked.emplace_back(count, pc);
+                const size_t shown = std::min<size_t>(40u, ranked.size());
+                std::partial_sort(ranked.begin(), ranked.begin() + shown, ranked.end(), std::greater<>());
+                std::cerr << "[pc-samples] total=" << total << std::hex;
+                for (size_t i = 0; i < shown; ++i)
+                    std::cerr << " " << ranked[i].second << ":" << std::dec << ranked[i].first << std::hex;
+                std::cerr << std::dec << std::endl;
+                counts.clear();
+                total = 0u;
+                lastReport = now;
+            }
+        }
+    }
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2706,6 +2942,22 @@ void PS2Runtime::run()
 
     std::atomic<bool> gameThreadFinished{false};
 
+    std::atomic<bool> samplerStop{false};
+    std::thread sampler;
+    if (std::getenv("PS2X_SAMPLE_PCS") != nullptr)
+        sampler = std::thread([&samplerStop]()
+                              { runPcSampler(samplerStop); });
+    struct SamplerJoin
+    {
+        std::atomic<bool> &stop;
+        std::thread &thread;
+        ~SamplerJoin()
+        {
+            stop.store(true);
+            if (thread.joinable())
+                thread.join();
+        }
+    } samplerJoin{samplerStop, sampler};
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
@@ -2778,6 +3030,48 @@ void PS2Runtime::run()
                 const double fps = static_cast<double>(changed - lastChanged) / elapsed;
                 const double vsync = static_cast<double>(presents - lastPresents) / elapsed;
                 SetWindowTitle(TextFormat("%s | %.0f fps | vsync %.0f/s", s_windowTitle.c_str(), fps, vsync));
+                static const bool profileTimeOnly = std::getenv("PS2X_PROFILE_TIME") != nullptr && std::getenv("PS2X_PROFILE_ALL") == nullptr;
+                if (profileTimeOnly)
+                {
+                    std::cerr << "[profile-time] fps=" << fps << " vsync=" << vsync
+                              << " gs=" << g_ps2ProfileNanos[0].exchange(0u) / 1000000 / elapsed
+                              << "ms/s vu1=" << g_ps2ProfileNanos[1].exchange(0u) / 1000000 / elapsed
+                              << "ms/s iop=" << g_ps2ProfileNanos[2].exchange(0u) / 1000000 / elapsed
+                              << "ms/s schedulerWait=" << g_ps2ProfileNanos[3].exchange(0u) / 1000000 / elapsed
+                              << "ms/s store32=" << g_ps2ProfileNanos[4].exchange(0u) / 1000000 / elapsed
+                              << "ms/s vif1=" << g_ps2ProfileNanos[5].exchange(0u) / 1000000 / elapsed
+                              << "ms/s dmaPending=" << g_ps2ProfileNanos[6].exchange(0u) / 1000000 / elapsed
+                              << "ms/s dmacHandlers=" << g_ps2ProfileNanos[7].exchange(0u) / 1000000 / elapsed << "ms/s" << std::endl;
+                    // Crude guest backtrace of the running context: stack words that point just after a jal/jalr.
+                    if (const R5900Context *sampled = g_ps2SampleContext.load(std::memory_order_relaxed))
+                    {
+                        const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(sampled->r[29], 0)) & PS2_RAM_MASK;
+                        const uint8_t *ram = m_memory.getRDRAM();
+                        std::cerr << "[stack-scan] pc=0x" << std::hex << sampled->pc << " sp=0x" << sp << ":";
+                        for (uint32_t offset = 0u; offset < 0x1000u && sp + offset + 4u <= PS2_RAM_SIZE; offset += 4u)
+                        {
+                            uint32_t word = 0u;
+                            std::memcpy(&word, ram + sp + offset, 4u);
+                            if (word < 0x100008u || word >= 0x5C0000u || (word & 3u) != 0u)
+                                continue;
+                            uint32_t call = 0u;
+                            std::memcpy(&call, ram + word - 8u, 4u);
+                            const bool isJal = (call >> 26) == 3u;
+                            const bool isJalr = (call & 0xFC00003Fu) == 9u;
+                            if (isJal || isJalr)
+                                std::cerr << " " << word;
+                        }
+                        std::cerr << std::dec << std::endl;
+                    }
+                    const auto kernel = m_eeScheduler->snapshot();
+                    std::cerr << "[profile-threads] seq=" << kernel.sequence << " running=" << kernel.runningThreadId;
+                    for (const auto &thread : kernel.threads)
+                        std::cerr << " t" << thread.id << ":st" << static_cast<int>(thread.status) << "/w"
+                                  << static_cast<int>(thread.waitReason) << "#" << thread.waitId << " inv" << thread.invocationDepth
+                                  << " wk" << thread.wakeupCount << "@0x" << std::hex << thread.pc << " ra0x" << thread.ra
+                                  << std::dec << " p" << thread.currentPriority;
+                    std::cerr << std::endl;
+                }
                 lastStatsTime = now;
                 lastPresents = presents;
                 lastChanged = changed;

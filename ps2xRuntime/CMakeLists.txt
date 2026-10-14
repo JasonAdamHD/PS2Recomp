@@ -408,6 +408,11 @@ if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")
 endif()
 
+option(PS2X_WRITE_WATCH "Debug: guest memory write watchpoints (PS2X_WATCH_ARM)" OFF)
+if(PS2X_WRITE_WATCH)
+    target_compile_definitions(ps2_runtime PUBLIC PS2X_WRITE_WATCH=1)
+endif()
+
 if(PS2X_ENABLE_RUNTIME_LOGS)
     target_compile_definitions(ps2_runtime PUBLIC
         PS2_RUNTIME_LOGS=1

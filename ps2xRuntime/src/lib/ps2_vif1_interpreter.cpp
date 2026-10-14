@@ -1,4 +1,7 @@
 // Based on Blackline Interactive implementation
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include "runtime/ps2_memory.h"
 #include <cstring>
 
@@ -79,6 +82,29 @@ namespace
 
         return 0u;
     }
+}
+
+namespace
+{
+    bool ps2VifProfileEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_PROFILE_TIME") != nullptr || std::getenv("PS2X_PROFILE_ALL") != nullptr;
+        return enabled;
+    }
+    struct VifProfileScope
+    {
+        int slot;
+        bool active = ps2VifProfileEnabled();
+        std::chrono::steady_clock::time_point start = active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        explicit VifProfileScope(int s) : slot(s) {}
+        ~VifProfileScope();
+    };
+}
+extern std::atomic<uint64_t> g_ps2ProfileNanos[8];
+VifProfileScope::~VifProfileScope()
+{
+    if (active)
+        g_ps2ProfileNanos[slot].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
 void PS2Memory::processVIF0Data(uint32_t srcPhys, uint32_t sizeBytes)
@@ -181,8 +207,12 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU0_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
-                    markVU0CodeModified();
+                    // Games re-send the same microcode often; only a real change invalidates decoded VU code.
+                    if (std::memcmp(m_vu0Code + destAddr, data + pos, copyBytes) != 0)
+                    {
+                        std::memcpy(m_vu0Code + destAddr, data + pos, copyBytes);
+                        markVU0CodeModified();
+                    }
                 }
             }
 
@@ -295,8 +325,48 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+namespace
+{
+    // PS2X_PROFILE_TIME: VIF1 volume counters, printed every 5 s.
+    struct Vif1Stats
+    {
+        uint64_t calls = 0, bytes = 0, unpacks = 0, vectors = 0, mscal = 0, directBytes = 0, unpackNanos = 0;
+        uint64_t opNanos[128] = {};
+        uint64_t opCount[128] = {};
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    };
+    Vif1Stats g_vif1Stats;
+
+    void reportVif1Stats()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - g_vif1Stats.last).count();
+        if (elapsed < 5.0)
+            return;
+        std::fprintf(stderr, "[vif1-stats] calls=%.0f/s bytes=%.0fKB/s unpacks=%.0f/s vectors=%.0f/s mscal=%.0f/s direct=%.0fKB/s unpack=%.0fms/s\n",
+                     g_vif1Stats.calls / elapsed, g_vif1Stats.bytes / 1024.0 / elapsed, g_vif1Stats.unpacks / elapsed,
+                     g_vif1Stats.vectors / elapsed, g_vif1Stats.mscal / elapsed, g_vif1Stats.directBytes / 1024.0 / elapsed,
+                     g_vif1Stats.unpackNanos / 1e6 / elapsed);
+        std::fprintf(stderr, "[vif1-ops]");
+        for (int op = 0; op < 128; ++op)
+            if (g_vif1Stats.opNanos[op] / 1e6 / elapsed >= 1.0)
+                std::fprintf(stderr, " %02x:%.0fms/s(%.0f/s)", op, g_vif1Stats.opNanos[op] / 1e6 / elapsed, g_vif1Stats.opCount[op] / elapsed);
+        std::fprintf(stderr, "\n");
+        g_vif1Stats = Vif1Stats{};
+        g_vif1Stats.last = now;
+    }
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    VifProfileScope vifScope(5);
+    const bool vifStats = ps2VifProfileEnabled();
+    if (vifStats)
+    {
+        ++g_vif1Stats.calls;
+        g_vif1Stats.bytes += sizeBytes;
+        reportVif1Stats();
+    }
     if (sizeBytes == 0u)
         return;
 
@@ -339,6 +409,21 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint16_t imm = cmd & 0xFFFF;
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
+
+        struct OpTimer
+        {
+            bool active;
+            uint8_t op;
+            std::chrono::steady_clock::time_point start;
+            ~OpTimer()
+            {
+                if (active)
+                {
+                    g_vif1Stats.opNanos[op] += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                    ++g_vif1Stats.opCount[op];
+                }
+            }
+        } opTimer{vifStats, opcode, vifStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
 
         // Track most-recent command for VIFn_CODE emulation.
         vif1_regs.code = cmd;
@@ -416,6 +501,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
+            if (vifStats)
+                ++g_vif1Stats.mscal;
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, runTop, runItop);
             continue;
@@ -476,8 +563,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
+                    if (std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
+                    {
+                        std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                        markVU1CodeModified();
+                    }
                 }
             }
             pos += mpgBytes;
@@ -572,6 +662,22 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
 
+            const auto unpackStart = vifStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            struct UnpackTimer
+            {
+                bool active;
+                std::chrono::steady_clock::time_point start;
+                ~UnpackTimer()
+                {
+                    if (active)
+                        g_vif1Stats.unpackNanos += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                }
+            } unpackTimer{vifStats, unpackStart};
+            if (vifStats)
+            {
+                ++g_vif1Stats.unpacks;
+                g_vif1Stats.vectors += writeVectorCount;
+            }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;

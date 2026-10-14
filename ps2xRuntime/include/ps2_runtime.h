@@ -237,6 +237,15 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+#ifdef PS2X_WRITE_WATCH
+// Debug watchpoint (PS2X_WRITE_WATCH builds): guest words armed with ps2WatchArm report every write that touches them.
+extern uint32_t g_ps2WatchCount;
+extern uint32_t g_ps2WatchAddrs[16];
+// Value watch: report non-stack writes of base + k*stride + rem for k < count (PS2X_WATCH_POOL=base:stride:count:rem).
+extern uint32_t g_ps2WatchPoolBase, g_ps2WatchPoolStride, g_ps2WatchPoolCount, g_ps2WatchPoolRem;
+void ps2WatchHit(uint32_t guestAddr, uint32_t size, uint64_t valueLo, const R5900Context *ctx);
+#endif
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -252,7 +261,26 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     (void)valueHi;
     (void)op;
     (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+#ifdef PS2X_WRITE_WATCH
+    if (g_ps2WatchPoolCount != 0u && size >= 4u)
+    {
+        const uint32_t value = static_cast<uint32_t>(valueLo);
+        const uint32_t delta = value - g_ps2WatchPoolBase;
+        if (delta < g_ps2WatchPoolStride * g_ps2WatchPoolCount && (delta % g_ps2WatchPoolStride) == g_ps2WatchPoolRem &&
+            (guestAddr & PS2_RAM_MASK) < 0x01E00000u)
+            ps2WatchHit(guestAddr, size, valueLo, ctx);
+    }
+    if (g_ps2WatchCount != 0u)
+    {
+        const uint32_t phys = guestAddr & PS2_RAM_MASK;
+        for (uint32_t i = 0; i < g_ps2WatchCount; ++i)
+        {
+            const uint32_t word = g_ps2WatchAddrs[i];
+            if (word + 4u > phys && word < phys + size)
+                ps2WatchHit(guestAddr, size, valueLo, ctx);
+        }
+    }
+#endif
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

@@ -1,6 +1,12 @@
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <sstream>
 #include "Common.h"
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
+
+static std::unordered_map<uint32_t, std::string> g_rpcLastCallInfo; // guarded by g_rpc_mutex
 
 namespace ps2_syscalls
 {
@@ -591,6 +597,15 @@ namespace ps2_syscalls
             guestDefaultResult = server->buf != 0u ? server->buf : receiveBuffer;
         }
         const bool serverDispatched = guestFunction != 0u && runtime->hasFunction(guestFunction);
+        {
+            // Remembered for the stuck-client report in SifCheckStatRpc.
+            std::ostringstream info;
+            info << std::hex << "sid=0x" << sid << " fno=0x" << rpcNum << " mode=0x" << mode << " end=0x" << endFunction
+                 << " handled=" << iopResult.handled << " guestFn=0x" << guestFunction << " serverDispatched=" << serverDispatched
+                 << " callbackPolicy=" << static_cast<int>(iopResult.callbackPolicy);
+            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            g_rpcLastCallInfo[clientPtr] = info.str();
+        }
 
         auto finishCall = [=](const R5900Context *guestResult, R5900Context &parent)
         {
@@ -833,7 +848,25 @@ namespace ps2_syscalls
         setReturnS32(ctx, 0);
     }
 
+    void SifCheckStatRpcLocked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool &busyOut);
+
     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        bool busy = false;
+        SifCheckStatRpcLocked(rdram, ctx, runtime, busy);
+        // A poll of a busy client stands for real time the EE spends waiting on the IOP. Polls cost host time but
+        // only a few EE cycles, so the IOP (driven by EE cycles) crawled while the game waited on it - level loads
+        // took minutes. Charge each busy poll as EE time (PS2X_RPC_POLL_CYCLES, default 4096 = ~14 us).
+        static const uint32_t pollCycles = []
+        {
+            const char *value = std::getenv("PS2X_RPC_POLL_CYCLES");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 4096u;
+        }();
+        if (busy && pollCycles != 0u && runtime)
+            runtime->eeScheduler().accountCycles(pollCycles);
+    }
+
+    void SifCheckStatRpcLocked(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime, bool &busyOut)
     {
         uint32_t clientPtr = getRegU32(ctx, 4);
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
@@ -844,6 +877,16 @@ namespace ps2_syscalls
             return;
         }
         setReturnS32(ctx, it->second.busy ? 1 : 0);
+        busyOut = it->second.busy;
+        // A client that stays busy across ~2 million polls never got its completion; report the call once.
+        static std::unordered_map<uint32_t, uint64_t> busyPolls;
+        uint64_t &polls = busyPolls[clientPtr];
+        polls = it->second.busy ? polls + 1u : 0u;
+        if (polls == 2000000u)
+        {
+            std::cerr << "[rpc-stuck] client 0x" << std::hex << clientPtr << std::dec << " busy since "
+                      << g_rpcLastCallInfo[clientPtr] << std::endl;
+        }
     }
 
     void SifSetRpcQueue(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

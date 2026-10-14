@@ -495,6 +495,18 @@ namespace ps2x::iop::detail
             }
             cpu.gpr[31] = kCallReturnSentinel;
             runCpu(cpu, budget);
+            if (cpu.pc != kCallReturnSentinel)
+            {
+                // The call did not return: it blocked or ran out of budget, and the rest of it is dropped.
+                static uint32_t reports = 0u;
+                if (reports++ < 50u)
+                {
+                    std::ostringstream out;
+                    out << "[IOP] call to 0x" << std::hex << address << " abandoned at pc=0x" << cpu.pc << std::dec
+                        << " yielded=" << cpu.yielded << " stopped=" << cpu.stopped << " depth=" << depth;
+                    log(LogLevel::Warning, out.str());
+                }
+            }
             return cpu.gpr[2];
         }
 
@@ -830,11 +842,23 @@ namespace ps2x::iop::detail
             const unsigned long parsed = value ? std::strtoul(value, nullptr, 10) : 0ul;
             return parsed >= 1ul ? static_cast<uint64_t>(parsed) : 8ull;
         }();
+        // The EE accounts cycles in small steps (every checkpoint). Running the IOP for each step spent most of
+        // its time in per-call servicing (DMA, callbacks, timers, scheduler scan), so let cycles accumulate to
+        // a quantum first (PS2X_IOP_QUANTUM, IOP cycles; default 1 = off: larger values stalled level loading).
+        static const uint64_t quantum = []
+        {
+            const char *value = std::getenv("PS2X_IOP_QUANTUM");
+            return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : 1ull;
+        }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / divider;
+        if (iopCycles < quantum)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         m_impl->eeCycleCarry = total % divider;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->runCycles(iopCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)

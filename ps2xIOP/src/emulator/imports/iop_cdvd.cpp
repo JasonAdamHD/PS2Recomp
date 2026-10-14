@@ -232,13 +232,14 @@ namespace ps2x::iop::detail
             {
                 const bool ok = readSectors(a0, a1, a2);
                 static uint32_t readLogCount = 0u;
-                if (++readLogCount <= 200u || (readLogCount % 200u) == 0u)
+                ++readLogCount;
+                if (!ok || readLogCount <= 200u || (readLogCount % 200u) == 0u)
                 {
                     std::ostringstream out;
                     out << "[IOP:cdvd] sceCdRead#" << readLogCount << " lsn=0x" << std::hex << a0
                         << " sectors=0x" << a1 << " dst=0x" << a2 << " ok=" << std::dec << ok
                         << " err=0x" << std::hex << lastError;
-                    host.log(LogLevel::Info, out.str());
+                    host.log(ok ? LogLevel::Info : LogLevel::Warning, out.str());
                 }
                 if (ok)
                 {
@@ -293,7 +294,7 @@ namespace ps2x::iop::detail
                 out << "[IOP:cdvd] sceCdSearchFile path=\"" << name << "\" found=" << found;
                 if (found)
                     out << " lsn=0x" << std::hex << memory.read32(a0) << " size=0x" << memory.read32(a0 + 4u);
-                host.log(LogLevel::Info, out.str());
+                host.log(found ? LogLevel::Info : LogLevel::Warning, out.str());
                 return true;
             }
 

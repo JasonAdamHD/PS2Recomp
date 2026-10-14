@@ -7,6 +7,13 @@
 
 struct GSDebugSnapshot;
 
+// Raw 64-bit drawing-environment registers, per context where the GS has two (native renderer input).
+struct GSRawDrawRegisters
+{
+    uint64_t frame[2]{}, zbuf[2]{}, test[2]{}, alpha[2]{}, tex0[2]{}, tex1[2]{}, clamp[2]{}, xyoffset[2]{}, scissor[2]{}, fba[2]{};
+    uint64_t prim = 0, prmodecont = 0, prmode = 0, texa = 0, fogcol = 0, dthe = 0, colclamp = 0, pabe = 0;
+};
+
 class GSRasterBackend
 {
 public:
@@ -20,6 +27,7 @@ public:
     virtual void ProcessGIF(uint32_t, const uint8_t *, uint32_t) {}
     virtual void WriteRegisterRaw(uint8_t, uint64_t) {}
     virtual void ReadRegisterState(GSDebugSnapshot &) const {}
+    virtual bool ReadRawDrawRegisters(GSRawDrawRegisters &) const { return false; }
     virtual uint64_t GetReadbackCount() const { return 0; }
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;

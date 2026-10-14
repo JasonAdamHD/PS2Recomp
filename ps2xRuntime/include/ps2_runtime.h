@@ -475,6 +475,21 @@ public:
     inline VU1Interpreter &vu1() { return m_vu1; }
     inline const VU1Interpreter &vu1() const { return m_vu1; }
 
+    // Native-renderer hooks. Both run on the thread that processes VIF1/GIF (the graphics worker when enabled).
+    // The VU1 hook sees every MSCAL/MSCNT before the interpreter runs; returning true skips the interpreter.
+    struct Vu1HookEvent
+    {
+        bool resume = false; // MSCNT rather than MSCAL
+        uint32_t startPC = 0; // byte address for MSCAL
+        uint32_t top = 0;
+        uint32_t itop = 0;
+    };
+    using Vu1Hook = std::function<bool(const Vu1HookEvent &)>;
+    void setVu1Hook(Vu1Hook hook) { m_vu1Hook = std::move(hook); }
+    // Sees every GIF packet (path 1-3) just before the GS consumes it.
+    using GifPacketObserver = std::function<void(uint32_t path, const uint8_t *data, uint32_t sizeBytes)>;
+    void setGifPacketObserver(GifPacketObserver observer) { m_gifPacketObserver = std::move(observer); }
+
     inline PS2AudioBackend &audioBackend() { return m_audioBackend; }
     inline const PS2AudioBackend &audioBackend() const { return m_audioBackend; }
     inline PSPadBackend &padBackend() { return m_padBackend; }
@@ -527,6 +542,8 @@ private:
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
+    Vu1Hook m_vu1Hook;
+    GifPacketObserver m_gifPacketObserver;
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;
     mutable std::mutex m_eeKernelStateMutex;

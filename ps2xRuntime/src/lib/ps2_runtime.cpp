@@ -846,7 +846,10 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
+                                    {
+                                        if (m_gifPacketObserver)
+                                            m_gifPacketObserver(static_cast<uint32_t>(path), data, size);
+                                        m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_gs.setExternalSyncHook([this]()
                              { m_memory.waitForGraphicsWorker(); });
@@ -862,6 +865,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     if (m_vu1Hook && m_vu1Hook(Vu1HookEvent{false, startPC, top, itop}))
+                                         return;
                                      Ps2ProfileScope vu1Scope(1);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
@@ -882,6 +887,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     if (m_vu1Hook && m_vu1Hook(Vu1HookEvent{true, 0u, top, itop}))
+                                         return;
                                      Ps2ProfileScope vu1Scope(1);
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,

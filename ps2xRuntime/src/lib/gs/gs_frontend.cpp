@@ -239,6 +239,12 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
     return m_displaySnapshot.data();
 }
 
+bool GS::readRawDrawRegisters(GSRawDrawRegisters &out) const
+{
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    return m_backend && m_backend->ReadRawDrawRegisters(out);
+}
+
 GSDebugSnapshot GS::getDebugSnapshot() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);

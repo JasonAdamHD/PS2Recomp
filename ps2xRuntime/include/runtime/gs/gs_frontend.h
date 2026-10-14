@@ -129,6 +129,8 @@ public:
         return m_ctx[(index != 0) ? 1 : 0].frame;
     }
     GSDebugSnapshot getDebugSnapshot() const;
+    // Raw drawing-environment registers from a raw-command backend (false when the backend cannot report them).
+    bool readRawDrawRegisters(GSRawDrawRegisters &out) const;
     std::vector<GSDebugHistoryEntry> getDebugHistory() const;
     void clearDebugHistory();
     bool isDebugHistoryPaused() const;

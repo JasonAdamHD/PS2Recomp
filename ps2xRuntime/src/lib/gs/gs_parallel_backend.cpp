@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "ps2_log.h"
 #include "gs_gl_interop.h"
+#include "../native/native_compose.h"
 #include "gs_interface.hpp"
 #include "thread_id.hpp"
 #include <algorithm>
@@ -383,7 +384,9 @@ namespace
             // PS2X_GS_NO_CRTC_OFFSETS=1 scans out the display rectangle without the DISPLAY DX/DY offsets.
             static const bool noCrtcOffsets = std::getenv("PS2X_GS_NO_CRTC_OFFSETS") != nullptr;
             info.crtc_offsets = !noCrtcOffsets;
-            return interop.present(gs.vsync(info));
+            // PS2X_NATIVE3D: the native 3D frame for the displayed page is composited onto the scanout.
+            const uint64_t dispfb = (request.pmode & 1u) ? request.dispfb1 : request.dispfb2;
+            return interop.present(ps2native::compose(interop.device(), gs.vsync(info), uint32_t(dispfb & 0x1ffu)));
         }
 
         uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
@@ -463,6 +466,34 @@ namespace
         {
             Lock lock(mutex);
             return transfer;
+        }
+
+        bool ReadRawDrawRegisters(GSRawDrawRegisters &out) const override
+        {
+            Lock lock(mutex);
+            const auto &r = gs.get_register_state();
+            for (unsigned i = 0; i < 2; ++i)
+            {
+                const auto &v = r.ctx[i];
+                out.frame[i] = v.frame.bits;
+                out.zbuf[i] = v.zbuf.bits;
+                out.test[i] = v.test.bits;
+                out.alpha[i] = v.alpha.bits;
+                out.tex0[i] = v.tex0.bits;
+                out.tex1[i] = v.tex1.bits;
+                out.clamp[i] = v.clamp.bits;
+                out.xyoffset[i] = v.xyoffset.bits;
+                out.scissor[i] = v.scissor.bits;
+                out.fba[i] = v.fba.bits;
+            }
+            out.prim = r.prim.bits;
+            out.prmodecont = r.prmodecont.bits;
+            out.texa = r.texa.bits;
+            out.fogcol = r.fogcol.bits;
+            out.dthe = r.dthe.bits;
+            out.colclamp = r.colclamp.bits;
+            out.pabe = r.pabe.bits;
+            return true;
         }
 
         void ReadRegisterState(GSDebugSnapshot &s) const override

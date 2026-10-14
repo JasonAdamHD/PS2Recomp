@@ -20,6 +20,7 @@
 #include <chrono>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <algorithm>
 #include <cctype>
@@ -591,6 +592,8 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // PS2X_IOP_LOG=1 enables the thread/hot-PC dumps below (and the one-off iop_ram.bin dump).
+        const bool iopDiagnostics = std::getenv("PS2X_IOP_LOG") != nullptr;
         std::chrono::steady_clock::time_point nextThreadDump{};
         std::map<uint32_t, uint64_t> slicePcHistogram;
         uint32_t threadDumpCount = 0;
@@ -602,7 +605,7 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
-                    if (std::chrono::steady_clock::now() >= nextThreadDump)
+                    if (iopDiagnostics && std::chrono::steady_clock::now() >= nextThreadDump)
                     {
                         nextThreadDump = std::chrono::steady_clock::now() + std::chrono::seconds(5);
                         log(LogLevel::Info, "[IOP:threads] cycles=" + std::to_string(totalCycles) + kernel.describeThreads());
@@ -649,7 +652,8 @@ namespace ps2x::iop::detail
                     }
                     const uint64_t before = totalCycles;
                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
-                    ++slicePcHistogram[next->cpu.pc];
+                    if (iopDiagnostics)
+                        ++slicePcHistogram[next->cpu.pc];
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
@@ -818,9 +822,17 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // The IOP runs at 1/8 of the EE clock on hardware. PS2X_IOP_CLOCK_DIVIDER overrides the ratio for
+        // experiments: a larger divider gives the (interpreted) IOP fewer cycles per EE cycle.
+        static const uint64_t divider = []
+        {
+            const char *value = std::getenv("PS2X_IOP_CLOCK_DIVIDER");
+            const unsigned long parsed = value ? std::strtoul(value, nullptr, 10) : 0ul;
+            return parsed >= 1ul ? static_cast<uint64_t>(parsed) : 8ull;
+        }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
+        const uint64_t iopCycles = total / divider;
+        m_impl->eeCycleCarry = total % divider;
         if (iopCycles)
             m_impl->runCycles(iopCycles);
     }

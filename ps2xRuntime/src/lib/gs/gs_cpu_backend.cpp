@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -396,6 +397,12 @@ namespace
 
     void applyFieldPresentation(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height, bool oddField)
     {
+        // Games that render whole frames into an interlaced display already hold both fields interleaved, so
+        // showing one line-doubled field per vsync ("bob") just makes the picture jump up and down a line.
+        // Present the woven frame unless PS2X_FIELD_BOB=1 asks for the old field-by-field output.
+        static const bool bobFields = std::getenv("PS2X_FIELD_BOB") != nullptr;
+        if (!bobFields)
+            return;
         if (pixels.empty() || width == 0u || height < 2u)
             return;
         const std::vector<uint8_t> source = pixels;

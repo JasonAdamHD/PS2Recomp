@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -79,7 +80,8 @@ namespace ps2x::iop::detail
 
                 const uint32_t size = static_cast<uint32_t>(signedSize);
                 static uint32_t iopDmaLogCount = 0u;
-                if (++iopDmaLogCount <= 300u || (iopDmaLogCount % 500u) == 0u)
+                static const bool logDma = std::getenv("PS2X_IOP_LOG") != nullptr;
+                if (logDma && (++iopDmaLogCount <= 300u || (iopDmaLogCount % 500u) == 0u))
                 {
                     char line[200];
                     std::snprintf(line, sizeof(line), "[IOP:sifdma#%u] src=0x%x dst=0x%x size=0x%x attr=0x%x owned=%d data=%x %x %x %x",
@@ -358,7 +360,8 @@ namespace ps2x::iop::detail
     void IopRpcBridge::logCommandPacket(uint32_t sid, const std::vector<uint8_t> &payload)
     {
         // Decodes the Atlas IO packet (0x48, count, {id, argc, args...}) so new EE requests show up in the log.
-        if (sid != 0x12345u || payload.size() < 4u)
+        static const bool enabled = std::getenv("PS2X_IOP_LOG") != nullptr;
+        if (!enabled || sid != 0x12345u || payload.size() < 4u)
             return;
         const auto half = [&](size_t index) -> uint16_t
         {
@@ -435,7 +438,8 @@ namespace ps2x::iop::detail
             }
         }
 
-        if (request.sid == 0x12345u && returnPointer != 0u)
+        static const bool logReplies = std::getenv("PS2X_IOP_LOG") != nullptr;
+        if (logReplies && request.sid == 0x12345u && returnPointer != 0u)
         {
             // Reply layout: word0 = record count | flags << 8, then 9-word slot records, then a status tail.
             const uint32_t header = m_memory.read32(returnPointer);

@@ -8,6 +8,7 @@
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -536,6 +537,11 @@ bool PS2IopHostAdapter::callEeRpc(uint32_t sid,
 
 void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
 {
+    // IOP modules and the emulator's diagnostics are chatty; flushing every line to the console costs real
+    // time. Info messages are shown only with PS2X_IOP_LOG=1; warnings and errors always are.
+    static const bool showInfo = std::getenv("PS2X_IOP_LOG") != nullptr;
+    if (level == ps2x::iop::LogLevel::Info && !showInfo)
+        return;
     const char *prefix = "[ps2xIOP]";
     if (level == ps2x::iop::LogLevel::Warning)
     {

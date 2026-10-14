@@ -368,7 +368,8 @@ namespace ps2_stubs
         (void)rdram;
         const uint32_t reqSize = getRegU32(ctx, 4);
         const uint32_t address = runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u;
-        std::cerr << "[sceSifAllocIopHeap] size=0x" << std::hex << reqSize << " -> 0x" << address << std::dec << std::endl;
+        if (address == 0u)
+            std::cerr << "[sceSifAllocIopHeap] failed size=0x" << std::hex << reqSize << std::dec << std::endl;
         setReturnU32(ctx, address);
     }
 

@@ -1,9 +1,11 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_threaded_backend.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <cstdlib>
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -106,8 +108,21 @@ namespace
 }
 
 
+namespace
+{
+    // PS2X_GS_THREAD=1 runs the CPU rasteriser on its own thread so the EE does not wait for it. It is opt-in:
+    // the timing change exposes a use-after-free in Billy & Mandy's Flash menus that is not fixed yet.
+    std::unique_ptr<GSRasterBackend> makeDefaultRasterBackend()
+    {
+        auto cpu = std::make_unique<GSCpuBackend>();
+        if (std::getenv("PS2X_GS_THREAD") == nullptr)
+            return cpu;
+        return std::make_unique<GSThreadedBackend>(std::move(cpu));
+    }
+}
+
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultRasterBackend())
 {
     reset();
 }
@@ -118,7 +133,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = makeDefaultRasterBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -261,6 +276,8 @@ GSDebugSnapshot GS::getDebugSnapshot() const
         snapshot.hasHostPresentationFrame = m_hasHostPresentationFrame;
     }
     snapshot.localToHostPendingBytes = transfer.localToHostPendingBytes;
+    if (m_backend && m_backend->UsesRawCommands())
+        m_backend->ReadRegisterState(snapshot);
     return snapshot;
 }
 
@@ -510,6 +527,9 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     if (!m_privRegs)
         return request;
     request.pmode = m_privRegs->pmode;
+    request.smode1 = m_privRegs->smode1;
+    request.syncv = m_privRegs->syncv;
+    request.field = static_cast<uint32_t>((m_privRegs->csr.load() >> 13u) & 1u);
     request.smode2 = m_privRegs->smode2;
     request.dispfb1 = m_privRegs->dispfb1;
     request.display1 = m_privRegs->display1;
@@ -519,14 +539,36 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.vsyncTick = m_privRegs->vsyncTick.load(std::memory_order_acquire);
     request.contextFrames[0] = m_ctx[0].frame;
     request.contextFrames[1] = m_ctx[1].frame;
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        GSDebugSnapshot state{};
+        m_backend->ReadRegisterState(state);
+        request.contextFrames[0] = state.ctx[0].frame;
+        request.contextFrames[1] = state.ctx[1].frame;
+    }
     request.preferredSource = m_preferredDisplaySourceFrame;
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
     return request;
 }
 
+namespace
+{
+    std::atomic<uint64_t> g_presentCount{0u};
+    std::atomic<uint64_t> g_changedFrameCount{0u};
+    std::atomic<uint64_t> g_rawGifPackets{0u}; // GIF packets sent to a raw-command (GPU) backend
+}
+
+void ps2GsPresentStats(uint64_t &presents, uint64_t &changedFrames)
+{
+    presents = g_presentCount.load(std::memory_order_relaxed);
+    changedFrames = g_changedFrameCount.load(std::memory_order_relaxed);
+}
+
 void GS::latchHostPresentationFrame()
 {
+    using LatchClock = std::chrono::steady_clock;
+    const auto latchStart = LatchClock::now();
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -534,6 +576,7 @@ void GS::latchHostPresentationFrame()
         {
             std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
             m_hostPresentationFrame.clear();
+            m_hostPresentationGpuFrame.reset();
             m_hasHostPresentationFrame = false;
             m_hostPresentationWidth = m_hostPresentationHeight = 0u;
             return;
@@ -541,14 +584,32 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
     }
 
+    const auto stateLocked = LatchClock::now();
     PresentationFrame frame{};
+    LatchClock::time_point synced{};
     {
         std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
         if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Presentation);
+            synced = LatchClock::now();
             frame = m_backend->Present(request);
+        }
+    }
+    {
+        // PS2X_LOG_PRESENT=1 also reports where presentation time goes (state lock, flush+sync, convert).
+        static const bool logTiming = std::getenv("PS2X_LOG_PRESENT") != nullptr;
+        static uint32_t timingLogs = 0u;
+        if (logTiming && timingLogs < 400u)
+        {
+            ++timingLogs;
+            const auto ms = [](LatchClock::time_point a, LatchClock::time_point b)
+            { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            const auto done = LatchClock::now();
+            std::cerr << "[present-time] lock=" << ms(latchStart, stateLocked) << "ms sync="
+                      << (synced == LatchClock::time_point{} ? 0.0 : ms(stateLocked, synced)) << "ms present="
+                      << (synced == LatchClock::time_point{} ? 0.0 : ms(synced, done)) << "ms" << std::endl;
         }
     }
 
@@ -562,12 +623,30 @@ void GS::latchHostPresentationFrame()
     const uint32_t width = frame.width;
     const uint32_t height = frame.height;
     const bool usedPreferred = frame.usedPreferred;
+    // Frame-rate statistics for the window title: a present counts as a new game frame when its image
+    // differs from the previous one (sampled hash of every 7th pixel).
+    {
+        static uint64_t lastHash = 0u;
+        // GPU frames stay on the GPU; count a new frame whenever GIF data arrived since the last present.
+        uint64_t hash = frame.gpu ? g_rawGifPackets.load(std::memory_order_relaxed) : 1469598103934665603ull;
+        for (size_t i = 0; i + 3 < frame.pixels.size(); i += 28)
+        {
+            uint32_t pixel = 0u;
+            std::memcpy(&pixel, frame.pixels.data() + i, sizeof(pixel));
+            hash = (hash ^ pixel) * 1099511628211ull;
+        }
+        g_presentCount.fetch_add(1u, std::memory_order_relaxed);
+        if (hasFrame && hash != lastHash)
+            g_changedFrameCount.fetch_add(1u, std::memory_order_relaxed);
+        lastHash = hash;
+    }
+
     // Some games (e.g. Billy & Mandy) display a buffer the runtime never fills, so presentation falls back to
     // the draw buffer, which every other vsync has just been cleared. Hold the last lit frame across a single
     // all-black present instead of flashing black; a real black screen still shows from the second black frame.
     static uint32_t consecutiveBlackPresents = 0u;
     static bool lastPresentLit = false;
-    const bool presentIsBlack = hasFrame && litPixels == 0u;
+    const bool presentIsBlack = hasFrame && !frame.gpu && litPixels == 0u;
     consecutiveBlackPresents = presentIsBlack ? consecutiveBlackPresents + 1u : 0u;
     if (presentIsBlack && consecutiveBlackPresents < 2u)
     {
@@ -575,10 +654,12 @@ void GS::latchHostPresentationFrame()
         if (m_hasHostPresentationFrame && lastPresentLit)
             return;
     }
-    lastPresentLit = litPixels != 0u;
+    lastPresentLit = litPixels != 0u || frame.gpu;
     {
         std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
         m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationGpuFrame = std::move(frame.gpu);
+        m_hostPresentationAspectRatio = frame.aspectRatio;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -599,8 +680,30 @@ void GS::latchHostPresentationFrame()
     if (logPresent && presentLogCount < 4000u)
     {
         ++presentLogCount;
+        if ((presentLogCount % 120u) == 0u)
+        {
+            // Count non-zero bytes in the displayed buffer and in the draw buffers, straight from GS memory.
+            std::vector<uint8_t> vram;
+            {
+                std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+                if (m_backend)
+                    m_backend->SnapshotVram(vram);
+            }
+            auto litBytes = [&](uint32_t fbp)
+            {
+                const size_t begin = static_cast<size_t>(fbp) * 8192u, end = std::min(vram.size(), begin + 640u * 448u * 4u);
+                size_t count = 0u;
+                for (size_t i = begin; i < end; ++i)
+                    count += vram[i] != 0u;
+                return count;
+            };
+            std::cerr << "[present-vram] gpu=" << (m_hostPresentationGpuFrame ? 1 : 0) << " w=" << width << " h=" << height
+                      << " fbp0=" << litBytes(0u) << " fbp8c=" << litBytes(0x8cu)
+                      << " ctx0=" << litBytes(request.contextFrames[0].fbp) << std::endl;
+        }
         std::cerr << "[present] tick=" << request.vsyncTick << std::hex << " pmode=0x" << request.pmode
-                  << " dispfb1=0x" << request.dispfb1 << " dispfb2=0x" << request.dispfb2
+                  << " dispfb1=0x" << request.dispfb1 << " dispfb2=0x" << request.dispfb2 << " display1=0x" << request.display1
+                  << " display2=0x" << request.display2 << " smode1=0x" << request.smode1 << " smode2=0x" << request.smode2
                   << " ctx0fbp=0x" << request.contextFrames[0].fbp << " ctx1fbp=0x" << request.contextFrames[1].fbp
                   << " shown=0x" << displayFbp << " src=0x" << sourceFbp << std::dec
                   << " pref=" << (usedPreferred ? 1 : 0) << " lit=" << litPixels << std::endl;
@@ -670,9 +773,53 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+bool ps2ProfileEnabled();
+extern std::atomic<uint64_t> g_ps2ProfileNanos[4];
+
+std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const
 {
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    if (!m_hostPresentationGpuFrame)
+        return {};
+    width = m_hostPresentationWidth;
+    height = m_hostPresentationHeight;
+    aspectRatio = m_hostPresentationAspectRatio;
+    return m_hostPresentationGpuFrame;
+}
+
+void GS::shutdownBackend()
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+    m_hostPresentationGpuFrame.reset();
+    m_hostPresentationFrame.clear();
+    m_hasHostPresentationFrame = false;
+    m_backend.reset();
+}
+
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
+{
+    struct GifProfileScope
+    {
+        bool active = ps2ProfileEnabled();
+        std::chrono::steady_clock::time_point start = active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~GifProfileScope()
+        {
+            if (active)
+                g_ps2ProfileNanos[0].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
+    } gifProfileScope;
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        if (data && sizeBytes && (sizeBytes & 15u) == 0u)
+        {
+            m_backend->ProcessGIF(path, data, sizeBytes);
+            g_rawGifPackets.fetch_add(1u, std::memory_order_relaxed);
+        }
+        return;
+    }
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
@@ -776,6 +923,14 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+
+    if (m_backend->UsesRawCommands())
+    {
+        m_backend->ProcessGIF(3, data, sizeBytes);
+        g_rawGifPackets.fetch_add(1u, std::memory_order_relaxed);
+        ++m_nativePackedGIFPacketCount;
+        return true;
+    }
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -1099,6 +1254,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        m_backend->WriteRegisterRaw(regAddr, value);
+        return;
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1649,12 +1809,19 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_backend && m_backend->UsesRawCommands())
+        return m_backend->ClearFramebuffer(getDebugSnapshot().ctx[(contextIndex != 0u) ? 1 : 0], rgba);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        const GSDebugSnapshot state = getDebugSnapshot();
+        return m_backend->ClearFramebuffer(state.ctx[state.prim.ctxt ? 1 : 0], rgba);
+    }
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
@@ -1667,7 +1834,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = makeDefaultRasterBackend();
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);

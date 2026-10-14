@@ -3,6 +3,9 @@
 #include "ps2_log.h"
 #include "ps2_runtime_macros.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -80,6 +83,18 @@ EeScheduler::EeScheduler(PS2Runtime &runtime)
 EeScheduler::~EeScheduler()
 {
     requestStop();
+}
+
+namespace
+{
+    // PS2X_PROFILE_ALL: time the scheduler spends waiting (idle or pacing to real time), slot 3.
+    struct SchedulerWaitScope
+    {
+        bool active;
+        std::chrono::steady_clock::time_point start;
+        SchedulerWaitScope();
+        ~SchedulerWaitScope();
+    };
 }
 
 void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
@@ -357,6 +372,40 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+
+    // Real-time catch-up. Guest time only advances by fixed charges per call and loop iteration, so a game
+    // polling through heavyweight runtime calls (RPC status, pad reads) can burn real time while adding few
+    // EE cycles, and vsync - which waits for both the cycle deadline and the host deadline - falls far behind
+    // the wall clock. Every 1024 checkpoints, if the next deadline's host time has passed, advance the EE
+    // clock (and with it the IOP and timers) to that deadline. PS2X_NO_CATCHUP=1 disables this.
+    static const bool catchUpEnabled = std::getenv("PS2X_NO_CATCHUP") == nullptr;
+    static uint32_t catchUpCounter = 0u;
+    if (catchUpEnabled && (++catchUpCounter & 0x3FFu) == 0u)
+    {
+        uint64_t deficit = 0u;
+        {
+            std::lock_guard lock(m_eventMutex);
+            const auto now = std::chrono::steady_clock::now();
+            uint64_t earliestCycle = std::numeric_limits<uint64_t>::max();
+            for (const ScheduledEvent &item : m_deadlines)
+            {
+                if (item.hostDeadline <= now && item.deadlineCycle > m_eeCycle && item.deadlineCycle < earliestCycle)
+                    earliestCycle = item.deadlineCycle;
+            }
+            if (earliestCycle != std::numeric_limits<uint64_t>::max())
+                deficit = earliestCycle - m_eeCycle;
+        }
+        if (deficit != 0u)
+        {
+            while (deficit > 0u)
+            {
+                const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(deficit, std::numeric_limits<uint32_t>::max()));
+                accountCycles(step);
+                deficit -= step;
+            }
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
+    }
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -1800,6 +1849,7 @@ void EeScheduler::processDueDeadlines()
 
             if (now < pacingDeadline)
             {
+                SchedulerWaitScope pacingWaitScope;
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire); });
@@ -2005,6 +2055,7 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        SchedulerWaitScope blockedWaitScope;
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
         return;
@@ -2036,6 +2087,7 @@ void EeScheduler::waitForEvent()
         }
     }
 
+    SchedulerWaitScope idleWaitScope;
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire); });
@@ -2143,4 +2195,16 @@ void EeScheduler::publishIdleDebugContext()
     {
         publishDebugContext(selected->activeContext());
     }
+}
+
+bool ps2ProfileEnabled();
+extern std::atomic<uint64_t> g_ps2ProfileNanos[4];
+SchedulerWaitScope::SchedulerWaitScope()
+    : active(ps2ProfileEnabled()), start(active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{})
+{
+}
+SchedulerWaitScope::~SchedulerWaitScope()
+{
+    if (active)
+        g_ps2ProfileNanos[3].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }

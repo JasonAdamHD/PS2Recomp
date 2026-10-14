@@ -28,6 +28,13 @@ namespace ps2_syscalls
 
             gs.smode2 = smode2;
 
+            // The BIOS also programs SMODE1 (video clock and colour system). The CPU renderer ignores it, but the
+            // parallel-gs GPU renderer needs it to recognise NTSC/PAL scanout.
+            const uint64_t cmod = videoMode == 3 ? 3u : videoMode == 2 ? 2u : 0u;
+            const uint64_t lc = (videoMode == 0x51 || videoMode == 0x52) ? 22u :
+                                (videoMode >= 0x1a && videoMode <= 0x4a) ? 15u : 32u;
+            gs.smode1 = (gs.smode1 & ~((127ull << 3) | (3ull << 13))) | (lc << 3) | (cmod << 13);
+
             // Keep CRT1 enabled after the BIOS syscall selects a display mode.
             if ((gs.pmode & 0x3ull) == 0ull)
             {

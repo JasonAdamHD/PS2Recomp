@@ -922,7 +922,7 @@ void VU1Interpreter::finishXgkick()
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
-        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes);
+        m_activeGs->processGIFPacket(m_xgkick.packet.data(), m_xgkick.totalBytes, 1u); // XGKICK is GIF PATH1
     m_xgkick.active = false;
 }
 

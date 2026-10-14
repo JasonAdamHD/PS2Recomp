@@ -222,9 +222,12 @@ static inline uint64_t Ps2FastRead64(const uint8_t *rdram, uint32_t addr)
     return value;
 }
 
+// Quadword accesses (LQ/SQ/LQC2/SQC2) ignore the low four address bits on the R5900, so they always touch
+// the enclosing 16-byte slot. Honouring an unaligned address instead spills up to 15 bytes into the next
+// slot, e.g. over a saved return address on the stack.
 static inline __m128i Ps2FastRead128(const uint8_t *rdram, uint32_t addr)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    const uint32_t offset = (addr & ~0xFu) & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];
@@ -297,7 +300,7 @@ static inline void Ps2FastWrite64(uint8_t *rdram, uint32_t addr, uint64_t value)
 
 static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
 {
-    const uint32_t offset = addr & PS2_RAM_MASK;
+    const uint32_t offset = (addr & ~0xFu) & PS2_RAM_MASK;
     if (!Ps2FastRangeIsContiguous(offset, sizeof(__m128i)))
     {
         alignas(16) uint8_t wrapped[sizeof(__m128i)];

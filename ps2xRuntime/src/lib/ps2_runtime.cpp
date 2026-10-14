@@ -13,8 +13,13 @@
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
+#ifdef PS2X_GS_PARALLEL
+#include "runtime/gs/gs_parallel_backend.h"
+#include "rlgl.h"
+#endif
 
 #include <iostream>
+#include <functional>
 #include <stdexcept>
 #include <fstream>
 #include <algorithm>
@@ -409,6 +414,92 @@ namespace
     }
 }
 
+// PS2X_PROFILE_ALL=1: wall time spent in heavy native subsystems, reported with the call profile.
+std::atomic<uint64_t> g_ps2ProfileNanos[4]{};
+bool ps2ProfileEnabled()
+{
+    static const bool enabled = std::getenv("PS2X_PROFILE_ALL") != nullptr;
+    return enabled;
+}
+struct Ps2ProfileScope
+{
+    int slot;
+    bool active;
+    std::chrono::steady_clock::time_point start;
+    explicit Ps2ProfileScope(int s) : slot(s), active(ps2ProfileEnabled()), start(active ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~Ps2ProfileScope()
+    {
+        if (active)
+            g_ps2ProfileNanos[slot].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+};
+
+namespace
+{
+    // PS2X_HEAP_TRACE=1: history of the game's heap calls (Billy & Mandy AtBa heap), dumped for the block
+    // holding the object involved when a guest call lands on a non-code address.
+    constexpr uint32_t kHeapAllocPc = 0x003C82E0u; // AllocHeapBlock(heap, size) -> ptr
+    constexpr uint32_t kHeapFreePc = 0x003C80E0u;  // FreeHeapBlock(heap, ptr)
+    constexpr uint32_t kChunkFreePc = 0x003C9350u; // AtBaFreeHeapChunk(ptr)
+
+    struct HeapTraceEntry
+    {
+        uint64_t seq = 0u;
+        char kind = 0; // 'A' alloc, 'F' FreeHeapBlock, 'C' AtBaFreeHeapChunk
+        uint32_t ptr = 0u;
+        uint32_t size = 0u;
+        uint32_t callSite = 0u;
+        uint32_t returnTo = 0u;
+    };
+
+    bool heapTraceEnabled()
+    {
+        static const bool enabled = std::getenv("PS2X_HEAP_TRACE") != nullptr;
+        return enabled;
+    }
+
+    std::vector<HeapTraceEntry> &heapTraceRing()
+    {
+        static std::vector<HeapTraceEntry> ring(1u << 18);
+        return ring;
+    }
+    uint64_t g_heapTraceSeq = 0u;
+    std::unordered_map<uint32_t, uint32_t> g_heapLiveSizes;
+
+    void heapTraceRecord(char kind, uint32_t ptr, uint32_t size, uint32_t callSite, uint32_t returnTo)
+    {
+        auto &ring = heapTraceRing();
+        HeapTraceEntry &entry = ring[g_heapTraceSeq % ring.size()];
+        entry = {++g_heapTraceSeq, kind, ptr, size, callSite, returnTo};
+    }
+
+    void heapTraceDumpAround(uint32_t address)
+    {
+        auto &ring = heapTraceRing();
+        std::cerr << "[heap-trace] history of blocks containing 0x" << std::hex << address << std::dec << ":" << std::endl;
+        const uint64_t first = g_heapTraceSeq > ring.size() ? g_heapTraceSeq - ring.size() + 1u : 1u;
+        uint32_t printed = 0u;
+        for (uint64_t seq = first; seq <= g_heapTraceSeq && printed < 200u; ++seq)
+        {
+            const HeapTraceEntry &entry = ring[seq % ring.size()];
+            if (entry.seq != seq || entry.ptr == 0u)
+                continue;
+            const uint32_t size = entry.size != 0u ? entry.size : 0x40u;
+            if (address < entry.ptr || address >= entry.ptr + size)
+                continue;
+            ++printed;
+            std::cerr << "[heap-trace] #" << entry.seq << " " << entry.kind << " ptr=0x" << std::hex << entry.ptr
+                      << " size=0x" << entry.size << " site=0x" << entry.callSite << " ret=0x" << entry.returnTo
+                      << std::dec << std::endl;
+        }
+        std::cerr << "[heap-trace] total heap calls=" << g_heapTraceSeq << std::endl;
+    }
+}
+
+void ps2PadSampleHostInput(); // ps2_pad.cpp: latches presses between guest pad reads
+void ps2GsPresentStats(uint64_t &presents, uint64_t &changedFrames); // gs_frontend.cpp
+static std::string s_windowTitle;
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -430,7 +521,18 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    {
+        // GPU backends keep the frame on the GPU; the render loop draws it directly.
+        float aspect = 0.0f;
+        uint32_t gpuWidth = 0u, gpuHeight = 0u;
+        if (rt->gs().getLatchedGpuFrame(gpuWidth, gpuHeight, aspect))
+        {
+            outWidth = gpuWidth;
+            outHeight = gpuHeight;
+            return;
+        }
+    }
+    if (!needsLatch && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -585,6 +687,7 @@ PS2Runtime::~PS2Runtime()
 
         if (IsWindowReady())
         {
+            m_gs.shutdownBackend();
             CloseWindow();
         }
 
@@ -643,6 +746,7 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
 
 void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
 {
+    Ps2ProfileScope iopScope(2);
     m_iopSubsystem->runEeCycles(eeCycles);
 }
 
@@ -701,8 +805,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -715,6 +819,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     Ps2ProfileScope vu1Scope(1);
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
@@ -769,8 +874,24 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        s_windowTitle = title ? title : "";
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+#endif
+#ifdef PS2X_GS_PARALLEL
+        // Vulkan GPU renderer (parallel-gs), shared with raylib's OpenGL context. PS2X_GS_CPU=1 keeps the CPU renderer.
+        if (std::getenv("PS2X_GS_CPU") == nullptr)
+        {
+            try
+            {
+                m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+                std::cerr << "[gs] using parallel-gs GPU renderer" << std::endl;
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "[gs] GPU renderer unavailable, using CPU renderer: " << error.what() << std::endl;
+            }
+        }
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
@@ -1231,6 +1352,23 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
 {
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
+    if (heapTraceEnabled())
+    {
+        const uint32_t badA0 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[4], 0));
+        heapTraceDumpAround(badA0);
+        heapTraceDumpAround(targetPc);
+        const uint32_t s1 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[17], 0));
+        std::cerr << "[heap-trace] memory s1..s1+0x600:" << std::hex;
+        for (uint32_t offset = 0u; offset < 0x600u; offset += 4u)
+        {
+            const uint32_t physical = (s1 + offset) & 0x1FFFFFFFu;
+            uint32_t value = 0u;
+            if (physical + 4u <= PS2_RAM_SIZE)
+                std::memcpy(&value, rdram + physical, 4u);
+            std::cerr << ((offset % 0x20u) == 0u ? "\n  " : " ") << value;
+        }
+        std::cerr << std::dec << std::endl;
+    }
 
     const uint32_t pc = ctx->pc;
     const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
@@ -1407,8 +1545,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
             uint32_t dumpSize = 0u;
             if (const char *range = std::getenv("PS2X_DUMP_RANGE"))
             {
+                // "<hex addr>:<hex size>" or "a<n>+<hex offset>:<hex size>" relative to argument register a0-a3.
+                uint32_t base = 0u;
+                if (range[0] == 'a' && range[1] >= '0' && range[1] <= '3' && range[2] == '+')
+                {
+                    base = getRegU32(ctx, 4 + (range[1] - '0'));
+                    range += 3;
+                }
                 char *end = nullptr;
-                dumpAddress = static_cast<uint32_t>(std::strtoul(range, &end, 16));
+                dumpAddress = base + static_cast<uint32_t>(std::strtoul(range, &end, 16));
                 if (end && *end == ':')
                     dumpSize = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
             }
@@ -1469,7 +1614,129 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+
+    // PS2X_PROFILE_ALL=1 counts every guest call target and prints the 20 busiest (calls/s) every 5 s.
+    {
+        static const bool profileAll = std::getenv("PS2X_PROFILE_ALL") != nullptr;
+        if (profileAll)
+        {
+            static std::unordered_map<uint32_t, uint64_t> callCounts;
+            static auto lastReport = std::chrono::steady_clock::now();
+            ++callCounts[targetPc];
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(now - lastReport).count();
+            if (elapsed >= 5.0)
+            {
+                std::vector<std::pair<uint64_t, uint32_t>> ranked;
+                ranked.reserve(callCounts.size());
+                for (const auto &[pc, count] : callCounts)
+                    ranked.emplace_back(count, pc);
+                const size_t shown = std::min<size_t>(20u, ranked.size());
+                std::partial_sort(ranked.begin(), ranked.begin() + shown, ranked.end(), std::greater<>());
+                std::cerr << "[profile-all]";
+                for (size_t i = 0; i < shown; ++i)
+                    std::cerr << " 0x" << std::hex << ranked[i].second << std::dec << ":" << static_cast<uint64_t>(ranked[i].first / elapsed);
+                std::cerr << std::endl;
+                const auto kernel = m_eeScheduler->snapshot();
+                std::cerr << "[profile-time] gs=" << g_ps2ProfileNanos[0].exchange(0u) / 1000000 / elapsed
+                          << "ms/s vu1=" << g_ps2ProfileNanos[1].exchange(0u) / 1000000 / elapsed
+                          << "ms/s iop=" << g_ps2ProfileNanos[2].exchange(0u) / 1000000 / elapsed
+                          << "ms/s schedulerWait=" << g_ps2ProfileNanos[3].exchange(0u) / 1000000 / elapsed << "ms/s" << std::endl;
+                std::cerr << "[profile-threads]";
+                for (const auto &thread : kernel.threads)
+                    std::cerr << " t" << thread.id << ":st" << static_cast<int>(thread.status) << "/w"
+                              << static_cast<int>(thread.waitReason) << "#" << thread.waitId << "@0x" << std::hex
+                              << thread.pc << " ra0x" << thread.ra << std::dec << " p" << thread.currentPriority;
+                std::cerr << std::endl;
+                callCounts.clear();
+                lastReport = now;
+            }
+        }
+    }
+
+    // PS2X_PROFILE_PCS=<hex pc>[,<hex pc>...] counts calls to those guest functions and the host time spent
+    // inside them (including callees), printing calls/s and ms/s every 5 seconds.
+    struct ProfiledPc
+    {
+        uint32_t pc = 0u;
+        uint64_t calls = 0u;
+        double ms = 0.0;
+    };
+    static std::vector<ProfiledPc> profiled = []
+    {
+        std::vector<ProfiledPc> list;
+        if (const char *value = std::getenv("PS2X_PROFILE_PCS"))
+        {
+            const char *cursor = value;
+            while (*cursor)
+            {
+                char *end = nullptr;
+                const unsigned long pc = std::strtoul(cursor, &end, 16);
+                if (end == cursor)
+                    break;
+                list.push_back({static_cast<uint32_t>(pc)});
+                cursor = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return list;
+    }();
+    ProfiledPc *profileEntry = nullptr;
+    if (!profiled.empty())
+    {
+        for (ProfiledPc &entry : profiled)
+            if (entry.pc == targetPc)
+                profileEntry = &entry;
+    }
+    const auto profileStart = profileEntry ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (profileEntry)
+        ++profileEntry->calls; // counted on entry: calls that block unwind instead of returning here
+    const bool traceHeap = heapTraceEnabled() && isCall &&
+                           (targetPc == kHeapAllocPc || targetPc == kHeapFreePc || targetPc == kChunkFreePc);
+    uint32_t heapAllocSize = 0u;
+    if (traceHeap)
+    {
+        const uint32_t returnTo = getRegU32(ctx, 31);
+        if (targetPc == kHeapAllocPc)
+            heapAllocSize = getRegU32(ctx, 5);
+        else
+        {
+            const uint32_t ptr = getRegU32(ctx, targetPc == kHeapFreePc ? 5 : 4);
+            const auto live = g_heapLiveSizes.find(ptr);
+            heapTraceRecord(targetPc == kHeapFreePc ? 'F' : 'C', ptr, live != g_heapLiveSizes.end() ? live->second : 0u, sourcePc, returnTo);
+            if (targetPc == kHeapFreePc && live != g_heapLiveSizes.end())
+                g_heapLiveSizes.erase(live);
+        }
+    }
     targetFn(rdram, ctx, this);
+    if (traceHeap && targetPc == kHeapAllocPc)
+    {
+        const uint32_t ptr = getRegU32(ctx, 2);
+        if (ptr != 0u)
+        {
+            g_heapLiveSizes[ptr] = heapAllocSize;
+            heapTraceRecord('A', ptr, heapAllocSize, sourcePc, fallthroughPc);
+        }
+    }
+    if (profileEntry)
+    {
+        profileEntry->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - profileStart).count();
+        static auto lastReport = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - lastReport).count();
+        if (elapsed >= 5.0)
+        {
+            std::cerr << "[profile]";
+            for (ProfiledPc &entry : profiled)
+            {
+                std::cerr << " 0x" << std::hex << entry.pc << std::dec << ": " << static_cast<int>(entry.calls / elapsed)
+                          << " calls/s " << static_cast<int>(entry.ms / elapsed) << " ms/s |";
+                entry.calls = 0u;
+                entry.ms = 0.0;
+            }
+            std::cerr << std::endl;
+            lastReport = now;
+        }
+    }
 
     if (isStopRequested() || ctx->pc == 0u)
     {
@@ -2140,6 +2407,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 {
+    vaddr &= ~0xFu; // quadword accesses ignore the low four address bits (see Ps2FastRead128)
     try
     {
         return m_memory.read128(vaddr);
@@ -2206,6 +2474,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
 {
+    vaddr &= ~0xFu; // quadword accesses ignore the low four address bits (see Ps2FastWrite128)
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
     ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
@@ -2493,9 +2762,36 @@ void PS2Runtime::run()
 
             }
         });
+        ps2PadSampleHostInput();
+        {
+            // Window title shows the game's frame rate (distinct images per second) and the vsync rate.
+            static auto lastStatsTime = std::chrono::steady_clock::now();
+            static uint64_t lastPresents = 0u;
+            static uint64_t lastChanged = 0u;
+            const auto now = std::chrono::steady_clock::now();
+            const double elapsed = std::chrono::duration<double>(now - lastStatsTime).count();
+            if (elapsed >= 1.0)
+            {
+                uint64_t presents = 0u;
+                uint64_t changed = 0u;
+                ps2GsPresentStats(presents, changed);
+                const double fps = static_cast<double>(changed - lastChanged) / elapsed;
+                const double vsync = static_cast<double>(presents - lastPresents) / elapsed;
+                SetWindowTitle(TextFormat("%s | %.0f fps | vsync %.0f/s", s_windowTitle.c_str(), fps, vsync));
+                lastStatsTime = now;
+                lastPresents = presents;
+                lastChanged = changed;
+            }
+        }
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+
+        Texture2D presentationTexture = frameTex;
+        float aspectRatio = 0.0f;
+        auto gpuFrame = m_gs.getLatchedGpuFrame(presentWidth, presentHeight, aspectRatio);
+        if (gpuFrame)
+            presentationTexture = Texture2D{static_cast<unsigned int>(gpuFrame->AcquireTexture()), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2503,8 +2799,9 @@ void PS2Runtime::run()
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
+        const float displayWidth = aspectRatio > 0.0f ? srcHeight * aspectRatio : srcWidth;
+        const float scale = std::min(screenWidth / displayWidth, screenHeight / srcHeight);
+        const float dstWidth = displayWidth * scale;
         const float dstHeight = srcHeight * scale;
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
@@ -2512,7 +2809,23 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#ifdef PS2X_GS_PARALLEL
+        // The scanout carries the PS2 framebuffer alpha (often 0); draw it opaque.
+        if (gpuFrame)
+        {
+            rlDrawRenderBatchActive();
+            rlDisableColorBlend();
+        }
+#endif
+        DrawTexturePro(presentationTexture, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+#ifdef PS2X_GS_PARALLEL
+        if (gpuFrame)
+        {
+            rlDrawRenderBatchActive();
+            rlEnableColorBlend();
+            gpuFrame->ReleaseTexture();
+        }
+#endif
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
@@ -2539,6 +2852,7 @@ void PS2Runtime::run()
         m_debugUiInitialized = false;
     }
     UnloadTexture(frameTex);
+    m_gs.shutdownBackend();
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

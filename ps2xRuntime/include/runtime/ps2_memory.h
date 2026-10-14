@@ -10,6 +10,7 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <memory>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -335,6 +336,12 @@ public:
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
+
+    // Graphics worker (default on, PS2X_GFX_THREAD=0 disables): GIF and VIF1 DMA (VIF1 unpack, VU1 microprograms, GS output) run on a worker thread,
+    // in parallel with the EE as on hardware. The EE waits for it before touching VU memory, VIF1/GIF state or
+    // the GS (waitForGraphicsWorker is a no-op on the worker itself and when the worker is off).
+    void waitForGraphicsWorker() const;
+    bool onGraphicsWorker() const;
     void processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount);
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr);
@@ -419,6 +426,12 @@ public:
         std::vector<uint8_t> chainData;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
+    struct GraphicsWorker;
+    std::unique_ptr<GraphicsWorker> m_graphicsWorker;
+    bool graphicsWorkerEnabled() const;
+    void snapshotTransfer(PendingTransfer &transfer) const;
+    void processGifTransferList(std::vector<PendingTransfer> &transfers);
+    void processVif1TransferList(std::vector<PendingTransfer> &transfers);
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;

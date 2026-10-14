@@ -1,6 +1,7 @@
 #ifndef PS2_VU1_H
 #define PS2_VU1_H
 
+#include <cstring>
 #include <array>
 #include <cstdint>
 
@@ -213,6 +214,8 @@ private:
 
     // Earliest readyCycle among queued pipeline entries; commitReadyPipelines() skips its scans before it.
     uint64_t m_nextCommitCycle = 0;
+    // Bit per pipeline that may hold entries (1 flag, 2 EFU, 4 store, 8 VF, 16 VI, 32 ACC).
+    uint32_t m_pipelineMask = 0;
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
@@ -291,7 +294,19 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    // Inline: called for every FMAC operand from the upper/lower instruction files.
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0xFFu)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;

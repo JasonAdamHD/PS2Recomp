@@ -848,9 +848,12 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_gs.setExternalSyncHook([this]()
+                             { m_memory.waitForGraphicsWorker(); });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // On the graphics worker (PS2X_GFX_THREAD) the scheduler belongs to the EE thread.
+                                     R5900Context *cpuContext = (m_eeScheduler && !m_memory.onGraphicsWorker()) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -869,7 +872,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     // On the graphics worker (PS2X_GFX_THREAD) the scheduler belongs to the EE thread.
+                                     R5900Context *cpuContext = (m_eeScheduler && !m_memory.onGraphicsWorker()) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
@@ -2877,6 +2881,9 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+void ps2NativeSamplerRegisterGameThread(); // native_sampler.cpp, PS2X_NATIVE_SAMPLE
+void ps2NativeSamplerStop();
+
 // PS2X_SAMPLE_PCS=1: a host thread samples the guest pc of the running EE context 5000 times a second and prints
 // the 40 hottest pcs every 5 seconds (resolve them to functions with map.csv).
 std::atomic<const R5900Context *> g_ps2SampleContext{nullptr};
@@ -2961,6 +2968,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        ps2NativeSamplerRegisterGameThread();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -3139,6 +3147,7 @@ void PS2Runtime::run()
     {
         gameThread.join();
     }
+    ps2NativeSamplerStop();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {

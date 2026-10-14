@@ -917,6 +917,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
 
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
@@ -970,6 +972,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            const uint8_t *data,
                            uint32_t sizeBytes)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
@@ -1248,6 +1252,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     writeRegisterUnlocked(regAddr, value);
 }
@@ -1808,6 +1814,8 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend && m_backend->UsesRawCommands())
         return m_backend->ClearFramebuffer(getDebugSnapshot().ctx[(contextIndex != 0u) ? 1 : 0], rgba);
@@ -1816,6 +1824,8 @@ bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_backend && m_backend->UsesRawCommands())
     {
@@ -1827,6 +1837,8 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
+    if (m_externalSync)
+        m_externalSync();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
 }

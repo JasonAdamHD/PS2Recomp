@@ -1,6 +1,7 @@
 #ifndef PS2_GS_FRONTEND_H
 #define PS2_GS_FRONTEND_H
 
+#include <functional>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -105,6 +106,9 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+    // Called before EE-side GS access (register writes, clears, readbacks) so queued GS work from another
+    // thread (PS2X_GFX_THREAD) lands first.
+    void setExternalSyncHook(std::function<void()> hook) { m_externalSync = std::move(hook); }
     void shutdownBackend();
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path = 3);
@@ -246,6 +250,7 @@ private:
     bool m_debugHistoryPaused = true;
 
     std::unique_ptr<GSRasterBackend> m_backend;
+    std::function<void()> m_externalSync;
 };
 
 #endif

@@ -844,11 +844,11 @@ namespace ps2x::iop::detail
         }();
         // The EE accounts cycles in small steps (every checkpoint). Running the IOP for each step spent most of
         // its time in per-call servicing (DMA, callbacks, timers, scheduler scan), so let cycles accumulate to
-        // a quantum first (PS2X_IOP_QUANTUM, IOP cycles; default 1 = off: larger values stalled level loading).
+        // a quantum first (PS2X_IOP_QUANTUM, IOP cycles; default 128 = ~3.5 us of IOP time, 1 = off).
         static const uint64_t quantum = []
         {
             const char *value = std::getenv("PS2X_IOP_QUANTUM");
-            return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : 1ull;
+            return value ? static_cast<uint64_t>(std::strtoull(value, nullptr, 10)) : 128ull;
         }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / divider;

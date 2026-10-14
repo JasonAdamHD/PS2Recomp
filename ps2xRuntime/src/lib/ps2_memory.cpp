@@ -1,3 +1,7 @@
+#include <functional>
+#include <deque>
+#include <condition_variable>
+#include <thread>
 #include <cstdlib>
 #include <chrono>
 #include "runtime/ps2_memory.h"
@@ -240,6 +244,106 @@ static inline uint32_t gs_vram_offset(uint32_t basePage, uint32_t x, uint32_t y,
     return basePage * 2048 + y * strideBytes + x * 4;
 }
 
+void ps2NativeSamplerRegisterThread(const char *role); // native_sampler.cpp
+
+struct PS2Memory::GraphicsWorker
+{
+    std::thread thread;
+    std::thread::id threadId;
+    mutable std::mutex mutex;
+    mutable std::condition_variable workAvailable;
+    mutable std::condition_variable idle;
+    std::deque<std::function<void()>> jobs;
+    bool busy = false;
+    bool stopping = false;
+
+    GraphicsWorker()
+    {
+        thread = std::thread([this]()
+                             {
+            threadId = std::this_thread::get_id();
+            ps2NativeSamplerRegisterThread("gfx");
+            for (;;)
+            {
+                std::function<void()> job;
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    workAvailable.wait(lock, [this]() { return stopping || !jobs.empty(); });
+                    if (jobs.empty())
+                        return;
+                    job = std::move(jobs.front());
+                    jobs.pop_front();
+                    busy = true;
+                }
+                try
+                {
+                    job();
+                }
+                catch (const std::exception &error)
+                {
+                    std::cerr << "[gfx-thread] job failed: " << error.what() << std::endl;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    busy = false;
+                    if (jobs.empty())
+                        idle.notify_all();
+                }
+            } });
+        // Wait until the thread id is published so onGraphicsWorker() is reliable.
+        while (threadId == std::thread::id{})
+            std::this_thread::yield();
+    }
+
+    ~GraphicsWorker()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        workAvailable.notify_all();
+        if (thread.joinable())
+            thread.join();
+    }
+
+    void post(std::function<void()> job)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            jobs.push_back(std::move(job));
+        }
+        workAvailable.notify_one();
+    }
+
+    void waitIdle() const
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        idle.wait(lock, [this]() { return jobs.empty() && !busy; });
+    }
+};
+
+bool PS2Memory::graphicsWorkerEnabled() const
+{
+    // On by default; PS2X_GFX_THREAD=0 keeps all GIF/VIF1/VU1 work on the EE thread.
+    static const bool enabled = []
+    {
+        const char *value = std::getenv("PS2X_GFX_THREAD");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool PS2Memory::onGraphicsWorker() const
+{
+    return m_graphicsWorker && std::this_thread::get_id() == m_graphicsWorker->threadId;
+}
+
+void PS2Memory::waitForGraphicsWorker() const
+{
+    if (m_graphicsWorker && std::this_thread::get_id() != m_graphicsWorker->threadId)
+        m_graphicsWorker->waitIdle();
+}
+
 PS2Memory::PS2Memory()
     : m_rdram(nullptr), m_scratchpad(nullptr), iop_ram(nullptr), m_seenGifCopy(false), m_gsVRAM(nullptr)
 {
@@ -248,6 +352,7 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    m_graphicsWorker.reset();
     if (m_rdram)
     {
         delete[] m_rdram;
@@ -560,11 +665,16 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     {
         return ptr;
     }
+    // VU1 memory belongs to the graphics worker while it runs (PS2X_GFX_THREAD).
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
+        waitForGraphicsWorker();
         return ptr;
     }
-    return mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    const uint8_t *vu1Data = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
+    if (vu1Data)
+        waitForGraphicsWorker();
+    return vu1Data;
 }
 
 uint32_t PS2Memory::translateAddress(uint32_t virtualAddress)
@@ -1126,6 +1236,10 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    // GIF/VIF1 registers and FIFOs belong to the graphics worker while it runs (PS2X_GFX_THREAD).
+    if ((address >= 0x10003000u && address < 0x10003100u) || (address >= 0x10003C00u && address < 0x10003E00u) ||
+        (address >= 0x10005000u && address < 0x10007000u))
+        waitForGraphicsWorker();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1685,29 +1799,11 @@ MemProfileScope::~MemProfileScope()
         g_ps2ProfileNanos[slot].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
-void PS2Memory::processPendingTransfers()
+void PS2Memory::processGifTransferList(std::vector<PendingTransfer> &transfers)
 {
-    MemProfileScope pendingScope(6);
-    const bool hadGif = !m_pendingGifTransfers.empty();
-    uint32_t observedGifQwc = 0u;
-    for (const auto &transfer : m_pendingGifTransfers)
+    for (size_t idx = 0; idx < transfers.size(); ++idx)
     {
-        const uint64_t transferQwc = !transfer.chainData.empty()
-                                         ? (transfer.chainData.size() / 16u)
-                                         : transfer.qwc;
-        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
-    }
-    if (observedGifQwc != 0u)
-    {
-        constexpr uint32_t kGifStat = 0x10003020u;
-        constexpr uint32_t kGifFqcMask = 0x1F000000u;
-        uint32_t &gifStat = m_ioRegisters[kGifStat];
-        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
-    }
-
-    for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
-    {
-        auto &p = m_pendingGifTransfers[idx];
+        auto &p = transfers[idx];
         if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
@@ -1767,7 +1863,127 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
+}
+
+void PS2Memory::processVif1TransferList(std::vector<PendingTransfer> &transfers)
+{
+    for (auto &p : transfers)
+    {
+        if (!p.chainData.empty())
+        {
+            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+        }
+        else if (p.qwc > 0)
+        {
+            uint32_t srcPhys = 0;
+            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
+            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
+            try
+            {
+                srcPhys = translateAddress(p.srcAddr);
+            }
+            catch (const std::exception &)
+            {
+                continue;
+            }
+            if (p.fromScratchpad)
+            {
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
+            }
+            else
+            {
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_RAM_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_RAM_SIZE)
+                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
+            }
+        }
+    }
+}
+
+void PS2Memory::snapshotTransfer(PendingTransfer &transfer) const
+{
+    // Copy normal-mode source data now, so a queued transfer reads what the EE had written at kick time.
+    if (!transfer.chainData.empty() || transfer.qwc == 0u)
+        return;
+    uint32_t srcPhys = 0;
+    try
+    {
+        srcPhys = const_cast<PS2Memory *>(this)->translateAddress(transfer.srcAddr);
+    }
+    catch (const std::exception &)
+    {
+        transfer.qwc = 0u;
+        return;
+    }
+    const uint8_t *base = transfer.fromScratchpad ? m_scratchpad : m_rdram;
+    const uint32_t size = transfer.fromScratchpad ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+    if (!base)
+        return;
+    const uint64_t bytes = static_cast<uint64_t>(transfer.qwc) * 16ull;
+    transfer.chainData.resize(static_cast<size_t>(bytes));
+    for (uint64_t copied = 0; copied < bytes;)
+    {
+        srcPhys %= size;
+        const uint64_t chunk = std::min<uint64_t>(bytes - copied, size - srcPhys);
+        std::memcpy(transfer.chainData.data() + copied, base + srcPhys, static_cast<size_t>(chunk));
+        copied += chunk;
+        srcPhys = static_cast<uint32_t>(srcPhys + chunk);
+    }
+}
+
+void PS2Memory::processPendingTransfers()
+{
+    MemProfileScope pendingScope(6);
+    const bool hadGif = !m_pendingGifTransfers.empty();
+    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    const bool useWorker = graphicsWorkerEnabled() && !onGraphicsWorker();
+    if (useWorker && !m_graphicsWorker)
+        m_graphicsWorker = std::make_unique<GraphicsWorker>();
+    uint32_t observedGifQwc = 0u;
+    for (const auto &transfer : m_pendingGifTransfers)
+    {
+        const uint64_t transferQwc = !transfer.chainData.empty()
+                                         ? (transfer.chainData.size() / 16u)
+                                         : transfer.qwc;
+        observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
+    }
+    if (observedGifQwc != 0u)
+    {
+        constexpr uint32_t kGifStat = 0x10003020u;
+        constexpr uint32_t kGifFqcMask = 0x1F000000u;
+        uint32_t &gifStat = m_ioRegisters[kGifStat];
+        gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+    }
+
+    if (!useWorker)
+    {
+        processGifTransferList(m_pendingGifTransfers);
+        m_pendingGifTransfers.clear();
+    }
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -1827,65 +2043,27 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif0Transfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
-    for (auto &p : m_pendingVif1Transfers)
+    if (!useWorker)
+        processVif1TransferList(m_pendingVif1Transfers);
+    else if (hadGif || hadVif1)
     {
-        if (!p.chainData.empty())
-        {
-            processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
-        }
-        else if (p.qwc > 0)
-        {
-            uint32_t srcPhys = 0;
-            const uint64_t bytes64 = static_cast<uint64_t>(p.qwc) * 16ull;
-            uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-            try
-            {
-                srcPhys = translateAddress(p.srcAddr);
-            }
-            catch (const std::exception &)
-            {
-                continue;
-            }
-            if (p.fromScratchpad)
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
-                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(m_scratchpad + srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-            else
-            {
-                uint32_t bytesLeft = sizeBytes;
-                while (bytesLeft > 0)
-                {
-                    if (srcPhys >= PS2_RAM_SIZE)
-                        srcPhys = 0;
-                    uint32_t chunk = bytesLeft;
-                    if (srcPhys + chunk > PS2_RAM_SIZE)
-                        chunk = PS2_RAM_SIZE - srcPhys;
-                    if (chunk == 0)
-                        break;
-                    processVIF1Data(srcPhys, chunk);
-                    bytesLeft -= chunk;
-                    srcPhys += chunk;
-                }
-            }
-        }
+        // GIF then VIF1 in kick order, on the worker; completion below stays on the EE (data is copied).
+        for (auto &transfer : m_pendingGifTransfers)
+            snapshotTransfer(transfer);
+        for (auto &transfer : m_pendingVif1Transfers)
+            snapshotTransfer(transfer);
+        m_graphicsWorker->post([this, gif = std::move(m_pendingGifTransfers), vif1 = std::move(m_pendingVif1Transfers)]() mutable
+                               {
+            processGifTransferList(gif);
+            processVif1TransferList(vif1);
+            if (m_gifArbiter)
+                m_gifArbiter->drain(); });
+        m_pendingGifTransfers.clear();
+        m_pendingVif1Transfers.clear();
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    if (m_gifArbiter && !useWorker)
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -1973,6 +2151,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 {
     if (!data || sizeBytes < 16)
         return;
+    waitForGraphicsWorker(); // the arbiter and GS see packets in submission order
 
     if (pathId == GifPathId::Path3)
     {
@@ -2306,6 +2485,10 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    // GIF/VIF1 registers and FIFOs belong to the graphics worker while it runs (PS2X_GFX_THREAD).
+    if ((address >= 0x10003000u && address < 0x10003100u) || (address >= 0x10003C00u && address < 0x10003E00u) ||
+        (address >= 0x10005000u && address < 0x10007000u))
+        waitForGraphicsWorker();
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

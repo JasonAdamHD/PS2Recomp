@@ -71,6 +71,12 @@ namespace ps2recomp
         bool m_emitInstructionComments = true;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
+        // Emit VU0 MAC/status flag updates for macro-mode FMAC and divide ops. Set per function by
+        // FunctionEmitter when the function reads CFC2 $16 (status) or $17 (MAC); off elsewhere to keep
+        // codegen cost down.
+        bool m_vu0TrackFlags = false;
+
+        std::string appendVu0FmacFlags(std::string code, uint8_t destMask) const;
 
         std::string translateInstruction(const Instruction &inst);
         std::string translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint);

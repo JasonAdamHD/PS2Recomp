@@ -122,6 +122,11 @@ namespace ps2recomp
         case COP2_CO + 15:
         {
             const uint8_t special1_func = static_cast<uint8_t>(inst.function & 0x3F);
+            // FMAC ops set MAC/status; the flag update is only emitted for functions that read them.
+            const auto fmac = [&](std::string code)
+            {
+                return m_codeGenerator.appendVu0FmacFlags(std::move(code), inst.vectorInfo.vectorField);
+            };
             if (special1_func >= 0x3C) // Special2 Table
             {
                 const uint8_t vu_func = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
@@ -131,59 +136,59 @@ namespace ps2recomp
                 case VU0_S2_VADDAy:
                 case VU0_S2_VADDAz:
                 case VU0_S2_VADDAw:
-                    return m_codeGenerator.translateVU_VADDA_Field(inst);
+                    return fmac(m_codeGenerator.translateVU_VADDA_Field(inst));
                 case VU0_S2_VSUBAx:
                 case VU0_S2_VSUBAy:
                 case VU0_S2_VSUBAz:
                 case VU0_S2_VSUBAw:
-                    return m_codeGenerator.translateVU_VSUBA_Field(inst);
+                    return fmac(m_codeGenerator.translateVU_VSUBA_Field(inst));
                 case VU0_S2_VMADDAx:
                 case VU0_S2_VMADDAy:
                 case VU0_S2_VMADDAz:
                 case VU0_S2_VMADDAw:
-                    return m_codeGenerator.translateVU_VMADDA_Field(inst);
+                    return fmac(m_codeGenerator.translateVU_VMADDA_Field(inst));
                 case VU0_S2_VMSUBAx:
                 case VU0_S2_VMSUBAy:
                 case VU0_S2_VMSUBAz:
                 case VU0_S2_VMSUBAw:
-                    return m_codeGenerator.translateVU_VMSUBA_Field(inst);
+                    return fmac(m_codeGenerator.translateVU_VMSUBA_Field(inst));
                 case VU0_S2_VMULAx:
                 case VU0_S2_VMULAy:
                 case VU0_S2_VMULAz:
                 case VU0_S2_VMULAw:
-                    return m_codeGenerator.translateVU_VMULA_Field(inst);
+                    return fmac(m_codeGenerator.translateVU_VMULA_Field(inst));
                 case VU0_S2_VADDA:
-                    return m_codeGenerator.translateVU_VADDA(inst);
+                    return fmac(m_codeGenerator.translateVU_VADDA(inst));
                 case VU0_S2_VADDAq:
-                    return m_codeGenerator.translateVU_VADDAq(inst);
+                    return fmac(m_codeGenerator.translateVU_VADDAq(inst));
                 case VU0_S2_VADDAi:
-                    return m_codeGenerator.translateVU_VADDAi(inst);
+                    return fmac(m_codeGenerator.translateVU_VADDAi(inst));
                 case VU0_S2_VMADDA:
-                    return m_codeGenerator.translateVU_VMADDA(inst);
+                    return fmac(m_codeGenerator.translateVU_VMADDA(inst));
                 case VU0_S2_VMADDAq:
-                    return m_codeGenerator.translateVU_VMADDAq(inst);
+                    return fmac(m_codeGenerator.translateVU_VMADDAq(inst));
                 case VU0_S2_VMADDAi:
-                    return m_codeGenerator.translateVU_VMADDAi(inst);
+                    return fmac(m_codeGenerator.translateVU_VMADDAi(inst));
                 case VU0_S2_VSUBA:
-                    return m_codeGenerator.translateVU_VSUBA(inst);
+                    return fmac(m_codeGenerator.translateVU_VSUBA(inst));
                 case VU0_S2_VSUBAq:
-                    return m_codeGenerator.translateVU_VSUBAq(inst);
+                    return fmac(m_codeGenerator.translateVU_VSUBAq(inst));
                 case VU0_S2_VSUBAi:
-                    return m_codeGenerator.translateVU_VSUBAi(inst);
+                    return fmac(m_codeGenerator.translateVU_VSUBAi(inst));
                 case VU0_S2_VMSUBA:
-                    return m_codeGenerator.translateVU_VMSUBA(inst);
+                    return fmac(m_codeGenerator.translateVU_VMSUBA(inst));
                 case VU0_S2_VMSUBAq:
-                    return m_codeGenerator.translateVU_VMSUBAq(inst);
+                    return fmac(m_codeGenerator.translateVU_VMSUBAq(inst));
                 case VU0_S2_VMSUBAi:
-                    return m_codeGenerator.translateVU_VMSUBAi(inst);
+                    return fmac(m_codeGenerator.translateVU_VMSUBAi(inst));
                 case VU0_S2_VMULA:
-                    return m_codeGenerator.translateVU_VMULA(inst);
+                    return fmac(m_codeGenerator.translateVU_VMULA(inst));
                 case VU0_S2_VMULAq:
-                    return m_codeGenerator.translateVU_VMULAq(inst);
+                    return fmac(m_codeGenerator.translateVU_VMULAq(inst));
                 case VU0_S2_VMULAi:
-                    return m_codeGenerator.translateVU_VMULAi(inst);
+                    return fmac(m_codeGenerator.translateVU_VMULAi(inst));
                 case VU0_S2_VOPMULA:
-                    return m_codeGenerator.translateVU_VOPMULA(inst);
+                    return fmac(m_codeGenerator.translateVU_VOPMULA(inst));
                 case VU0_S2_VITOF0:
                     return m_codeGenerator.translateVU_VITOF(inst, 0);
                 case VU0_S2_VITOF4:
@@ -302,23 +307,23 @@ namespace ps2recomp
             case VU0_S1_VADDy:
             case VU0_S1_VADDz:
             case VU0_S1_VADDw:
-                return m_codeGenerator.translateVU_VADD_Field(inst);
+                return fmac(m_codeGenerator.translateVU_VADD_Field(inst));
             case VU0_S1_VSUBx:
             case VU0_S1_VSUBy:
             case VU0_S1_VSUBz:
             case VU0_S1_VSUBw:
-                return m_codeGenerator.translateVU_VSUB_Field(inst);
+                return fmac(m_codeGenerator.translateVU_VSUB_Field(inst));
             case VU0_S1_VMULx:
             case VU0_S1_VMULy:
             case VU0_S1_VMULz:
             case VU0_S1_VMULw:
-                return m_codeGenerator.translateVU_VMUL_Field(inst);
+                return fmac(m_codeGenerator.translateVU_VMUL_Field(inst));
             case VU0_S1_VADD:
-                return m_codeGenerator.translateVU_VADD(inst);
+                return fmac(m_codeGenerator.translateVU_VADD(inst));
             case VU0_S1_VSUB:
-                return m_codeGenerator.translateVU_VSUB(inst);
+                return fmac(m_codeGenerator.translateVU_VSUB(inst));
             case VU0_S1_VMUL:
-                return m_codeGenerator.translateVU_VMUL(inst);
+                return fmac(m_codeGenerator.translateVU_VMUL(inst));
             case VU0_S1_VIADD:
                 return m_codeGenerator.translateVU_VIADD(inst);
             case VU0_S1_VISUB:
@@ -334,27 +339,27 @@ namespace ps2recomp
             case VU0_S1_VCALLMSR:
                 return m_codeGenerator.translateVU_VCALLMSR(inst);
             case VU0_S1_VADDq:
-                return m_codeGenerator.translateVU_VADDq(inst);
+                return fmac(m_codeGenerator.translateVU_VADDq(inst));
             case VU0_S1_VSUBq:
-                return m_codeGenerator.translateVU_VSUBq(inst);
+                return fmac(m_codeGenerator.translateVU_VSUBq(inst));
             case VU0_S1_VMULq:
-                return m_codeGenerator.translateVU_VMULq(inst);
+                return fmac(m_codeGenerator.translateVU_VMULq(inst));
             case VU0_S1_VADDi:
-                return m_codeGenerator.translateVU_VADDi(inst);
+                return fmac(m_codeGenerator.translateVU_VADDi(inst));
             case VU0_S1_VSUBi:
-                return m_codeGenerator.translateVU_VSUBi(inst);
+                return fmac(m_codeGenerator.translateVU_VSUBi(inst));
             case VU0_S1_VMULi:
-                return m_codeGenerator.translateVU_VMULi(inst);
+                return fmac(m_codeGenerator.translateVU_VMULi(inst));
             case VU0_S1_VMADDx:
             case VU0_S1_VMADDy:
             case VU0_S1_VMADDz:
             case VU0_S1_VMADDw:
-                return m_codeGenerator.translateVU_VMADD_Field(inst);
+                return fmac(m_codeGenerator.translateVU_VMADD_Field(inst));
             case VU0_S1_VMSUBx:
             case VU0_S1_VMSUBy:
             case VU0_S1_VMSUBz:
             case VU0_S1_VMSUBw:
-                return m_codeGenerator.translateVU_VMSUB_Field(inst);
+                return fmac(m_codeGenerator.translateVU_VMSUB_Field(inst));
             case VU0_S1_VMAXx:
             case VU0_S1_VMAXy:
             case VU0_S1_VMAXz:
@@ -370,23 +375,23 @@ namespace ps2recomp
             case VU0_S1_VMINIi:
                 return m_codeGenerator.translateVU_VMINIi(inst);
             case VU0_S1_VMADD:
-                return m_codeGenerator.translateVU_VMADD(inst);
+                return fmac(m_codeGenerator.translateVU_VMADD(inst));
             case VU0_S1_VMADDq:
-                return m_codeGenerator.translateVU_VMADDq(inst);
+                return fmac(m_codeGenerator.translateVU_VMADDq(inst));
             case VU0_S1_VMADDi:
-                return m_codeGenerator.translateVU_VMADDi(inst);
+                return fmac(m_codeGenerator.translateVU_VMADDi(inst));
             case VU0_S1_VMAX:
                 return m_codeGenerator.translateVU_VMAX(inst);
             case VU0_S1_VOPMSUB:
-                return m_codeGenerator.translateVU_VOPMSUB(inst);
+                return fmac(m_codeGenerator.translateVU_VOPMSUB(inst));
             case VU0_S1_VMINI:
                 return m_codeGenerator.translateVU_VMINI(inst);
             case VU0_S1_VMSUB:
-                return m_codeGenerator.translateVU_VMSUB(inst);
+                return fmac(m_codeGenerator.translateVU_VMSUB(inst));
             case VU0_S1_VMSUBq:
-                return m_codeGenerator.translateVU_VMSUBq(inst);
+                return fmac(m_codeGenerator.translateVU_VMSUBq(inst));
             case VU0_S1_VMSUBi:
-                return m_codeGenerator.translateVU_VMSUBi(inst);
+                return fmac(m_codeGenerator.translateVU_VMSUBi(inst));
             default:
                 return m_codeGenerator.emitUnhandledInstruction(inst, fmt::format("Unhandled VU0 Special1 function: 0x{:X}", special1_func));
             }

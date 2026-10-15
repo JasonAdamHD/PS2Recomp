@@ -92,6 +92,9 @@ namespace ps2recomp
         CodeGenerator &cg = m_codeGenerator;
         std::stringstream ss;
         cg.m_currentFunctionName = function.name;
+        cg.m_vu0TrackFlags = std::any_of(instructions.begin(), instructions.end(), [](const Instruction &inst)
+                                         { return inst.opcode == OPCODE_COP2 && inst.rs == COP2_CFC2 &&
+                                                  (inst.rd == VU0_CR_STATUS || inst.rd == VU0_CR_MAC); });
 
         std::string::size_type headerEnd = 0;
         if (useHeaders)

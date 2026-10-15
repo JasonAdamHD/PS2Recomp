@@ -148,6 +148,76 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
 
+// VU0 macro-mode flag updates. MAC and the dest mask share a layout (bit 0 = w ... bit 3 = x), so a
+// lane-order movemask (bit 0 = x) is bit-reversed before masking. MAC is Z[3:0] S[7:4] U[11:8] O[15:12];
+// status keeps I/D (bits 4-5) and the sticky bits, replaces Z/S/U/O (bits 0-3) and ORs them into the
+// sticky copies at bits 6-9. A denormal result counts as zero + underflow, matching the VU interpreter.
+static inline uint32_t Ps2Vu0LaneMaskToMac(uint32_t laneMask)
+{
+    return ((laneMask & 0x1u) << 3) | ((laneMask & 0x2u) << 1) | ((laneMask & 0x4u) >> 1) | ((laneMask & 0x8u) >> 3);
+}
+
+static inline void Ps2Vu0UpdateFmacFlags(R5900Context *ctx, __m128 result, uint32_t dest)
+{
+    if (dest == 0u)
+        return;
+    const __m128i bits = _mm_castps_si128(result);
+    const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+    const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+    const __m128i zeroExp = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+    const __m128i underflow = _mm_andnot_si128(_mm_cmpeq_epi32(magnitude, _mm_setzero_si128()), zeroExp);
+    const __m128i overflow = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+
+    const uint32_t z = Ps2Vu0LaneMaskToMac(static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(zeroExp)))) & dest;
+    const uint32_t s = Ps2Vu0LaneMaskToMac(static_cast<uint32_t>(_mm_movemask_ps(result))) & dest;
+    const uint32_t u = Ps2Vu0LaneMaskToMac(static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(underflow)))) & dest;
+    const uint32_t o = Ps2Vu0LaneMaskToMac(static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(overflow)))) & dest;
+    ctx->vu0_mac_flags = z | (s << 4) | (u << 8) | (o << 12);
+
+    const uint32_t current = (z ? 0x1u : 0u) | (s ? 0x2u : 0u) | (u ? 0x4u : 0u) | (o ? 0x8u : 0u);
+    ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0xFF0u) | current | (current << 6));
+}
+
+// Replaces the I/D bits (4-5) with the latest divide-unit result and ORs them into IS/DS (bits 10-11).
+static inline void Ps2Vu0SetDivFlags(R5900Context *ctx, uint32_t divFlags)
+{
+    ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0xFCFu) | divFlags | (divFlags << 6));
+}
+
+// VU divide unit. The VU has no infinities: x/0 gives +/-FLT_MAX (sign = sign(fs) ^ sign(ft)) and raises
+// D, or I for 0/0. SQRT and RSQRT use |ft| and raise I for a negative radicand; RSQRT by zero gives
+// +/-FLT_MAX with the sign of fs. *divFlags gets 0x10 (I) / 0x20 (D) for Ps2Vu0SetDivFlags.
+static inline float Ps2Vu0Div(float fs, float ft, uint32_t *divFlags)
+{
+    if (ft == 0.0f)
+    {
+        *divFlags = (fs == 0.0f) ? 0x10u : 0x20u;
+        return (std::signbit(fs) != std::signbit(ft)) ? -3.402823466e+38f : 3.402823466e+38f;
+    }
+    *divFlags = 0u;
+    return fs / ft;
+}
+
+static inline float Ps2Vu0Sqrt(float ft, uint32_t *divFlags)
+{
+    *divFlags = (ft < 0.0f) ? 0x10u : 0u;
+    return sqrtf(fabsf(ft));
+}
+
+static inline float Ps2Vu0Rsqrt(float fs, float ft, uint32_t *divFlags)
+{
+    const float den = sqrtf(fabsf(ft));
+    if (den == 0.0f)
+    {
+        *divFlags = (fs == 0.0f) ? 0x10u : 0x20u;
+        return std::signbit(fs) ? -3.402823466e+38f : 3.402823466e+38f;
+    }
+    *divFlags = (ft < 0.0f) ? 0x10u : 0u;
+    return fs / den;
+}
+
+#define PS2_VU0_FMAC_FLAGS(ctx, result, dest) Ps2Vu0UpdateFmacFlags((ctx), (result), (dest))
+
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
 // Slow path: Full runtime->Load/Store

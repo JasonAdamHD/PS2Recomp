@@ -439,9 +439,11 @@ namespace ps2recomp
             if (m_branchInst.rs == COP2_BC)
             {
                 const uint8_t bcCond = static_cast<uint8_t>(m_branchInst.rt);
+                // CPCOND2 is VU0 busy (VPU-STAT VBS0), not status bit 0, which is the Z flag. VU0
+                // microprograms run to completion here, so VBS0 normally reads 0.
                 return (bcCond == COP2_BC_BCF || bcCond == COP2_BC_BCFL)
-                           ? "!(ctx->vu0_status & 0x1)"
-                           : "(ctx->vu0_status & 0x1)";
+                           ? "!(ctx->vu0_vpu_stat & 0x1)"
+                           : "(ctx->vu0_vpu_stat & 0x1)";
             }
             break;
         default:

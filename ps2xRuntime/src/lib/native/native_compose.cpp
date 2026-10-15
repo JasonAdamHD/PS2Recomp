@@ -8,6 +8,8 @@
 #include "native3d_frag.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -258,8 +260,62 @@ namespace ps2native
             cmd->set_vertex_attrib(1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(Vertex, rgba));
             cmd->set_vertex_attrib(2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, st)); // st + q
 
+            // PS2X_NATIVE_PICK=x,y: every few seconds, log the draws covering that target pixel.
+            static const char *pickEnv = std::getenv("PS2X_NATIVE_PICK");
+            static auto lastPick = std::chrono::steady_clock::now();
+            const bool pick = pickEnv && std::chrono::steady_clock::now() - lastPick > std::chrono::seconds(4);
+            float pickX = 0, pickY = 0;
+            if (pick)
+            {
+                lastPick = std::chrono::steady_clock::now();
+                std::sscanf(pickEnv, "%f,%f", &pickX, &pickY);
+                std::fprintf(stderr, "[native-pick] frame with %zu batches, pixel (%g, %g):\n", frame->batches.size(), pickX, pickY);
+            }
+            uint32_t batchIndex = 0;
             for (const Batch &batch : frame->batches)
             {
+                ++batchIndex;
+                if (pick)
+                {
+                    const unsigned c = unsigned(batch.prim >> 9) & 1u;
+                    const float ox = float(batch.regs.xyoffset[c] & 0xffffu), oy = float((batch.regs.xyoffset[c] >> 32) & 0xffffu);
+                    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+                    for (const Vertex &v : batch.vertices)
+                    {
+                        float wx, wy;
+                        if (batch.screenSpace)
+                        {
+                            wx = v.pos[0];
+                            wy = v.pos[1];
+                        }
+                        else
+                        {
+                            const float *m = batch.objectToClip;
+                            float clip[4];
+                            for (int r = 0; r < 4; ++r)
+                                clip[r] = m[r] * v.pos[0] + m[4 + r] * v.pos[1] + m[8 + r] * v.pos[2] + m[12 + r];
+                            if (clip[3] <= 0.0f)
+                                continue;
+                            wx = clip[0] / clip[3] * batch.screenScale[0] + batch.screenOffset[0];
+                            wy = clip[1] / clip[3] * batch.screenScale[1] + batch.screenOffset[1];
+                        }
+                        x0 = std::min(x0, (wx - ox) / 16.0f);
+                        x1 = std::max(x1, (wx - ox) / 16.0f);
+                        y0 = std::min(y0, (wy - oy) / 16.0f);
+                        y1 = std::max(y1, (wy - oy) / 16.0f);
+                    }
+                    if (pickX >= x0 && pickX <= x1 && pickY >= y0 && pickY <= y1)
+                    {
+                        const Vertex &v = batch.vertices.front();
+                        std::fprintf(stderr, "[native-pick]  #%u %s tag %u prim 0x%llx tex0 0x%llx tex1 0x%llx clamp 0x%llx alpha 0x%llx test 0x%llx frame 0x%llx fba %llu texa 0x%llx verts %zu rgba0 0x%08x st0 (%g %g %g) bbox (%.0f,%.0f)-(%.0f,%.0f)\n",
+                                     batchIndex, batch.screenSpace ? "gs" : "vu", batch.debugTag, (unsigned long long)batch.prim,
+                                     (unsigned long long)batch.regs.tex0[c], (unsigned long long)batch.regs.tex1[c],
+                                     (unsigned long long)batch.regs.clamp[c], (unsigned long long)batch.regs.alpha[c],
+                                     (unsigned long long)batch.regs.test[c], (unsigned long long)batch.regs.frame[c],
+                                     (unsigned long long)(batch.regs.fba[c] & 1u), (unsigned long long)batch.regs.texa,
+                                     batch.vertices.size(), v.rgba, v.st[0], v.st[1], v.q, x0, y0, x1, y1);
+                    }
+                }
                 if (batch.vertices.empty() || batch.indices.empty())
                     continue;
                 const unsigned ctx = unsigned(batch.prim >> 9) & 1u;

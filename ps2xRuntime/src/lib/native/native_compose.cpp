@@ -50,8 +50,8 @@ namespace ps2native
         }
 
         // GS blending: ((A - B) * C >> 7) + D with A, B, D in {Cs, Cd, 0} and C in {As, Ad, FIX}.
-        // Maps the combinations a fixed-function blender can express; anything else draws opaque.
-        void applyBlend(Vulkan::CommandBuffer &cmd, uint64_t alpha)
+        // Maps the combinations a fixed-function blender can express; anything else draws opaque (returns false).
+        bool applyBlend(Vulkan::CommandBuffer &cmd, uint64_t alpha)
         {
             const unsigned a = alpha & 3u, b = (alpha >> 2) & 3u, c = (alpha >> 4) & 3u, d = (alpha >> 6) & 3u;
             VkBlendFactor factor = c == 0 ? VK_BLEND_FACTOR_SRC_ALPHA : (c == 1 ? VK_BLEND_FACTOR_DST_ALPHA : VK_BLEND_FACTOR_CONSTANT_ALPHA);
@@ -106,15 +106,51 @@ namespace ps2native
                 src = VK_BLEND_FACTOR_ONE;
                 dst = factor;
             }
+            else if (a == Cd && b == Cs && d == Zero)
+            {
+                // Subtractive: (Cd - Cs) * C, clamped at 0 (scorch marks and dark overlays).
+                src = factor;
+                dst = factor;
+                op = VK_BLEND_OP_REVERSE_SUBTRACT;
+            }
+            else if (a == Cs && b == Cd && d == Zero)
+            {
+                src = factor;
+                dst = factor;
+                op = VK_BLEND_OP_SUBTRACT;
+            }
+            else if (a == Cd && b == Zero && d == Zero)
+            {
+                src = VK_BLEND_FACTOR_ZERO;
+                dst = factor;
+            }
+            else if (a == Zero && b == Cd && d == Cd)
+            {
+                src = VK_BLEND_FACTOR_ZERO;
+                dst = inverse;
+            }
+            else if (a == Zero && b == Cd && d == Cs)
+            {
+                src = VK_BLEND_FACTOR_ONE;
+                dst = factor;
+                op = VK_BLEND_OP_SUBTRACT;
+            }
+            else if (a == Zero && d == Zero)
+            {
+                // -B * C clamps to black.
+                src = VK_BLEND_FACTOR_ZERO;
+                dst = VK_BLEND_FACTOR_ZERO;
+            }
             else
             {
                 cmd.set_blend_enable(false);
-                return;
+                return false;
             }
             cmd.set_blend_enable(true);
             // The GS never blends alpha: the framebuffer gets As (stored as As / 0x80, the scale DST_ALPHA expects).
             cmd.set_blend_factors(src, VK_BLEND_FACTOR_ONE, dst, VK_BLEND_FACTOR_ZERO);
             cmd.set_blend_op(op, VK_BLEND_OP_ADD);
+            return true;
         }
 
         struct GpuTexture
@@ -332,10 +368,26 @@ namespace ps2native
                 cmd->set_depth_test(zte, zte && !zmask);
                 cmd->set_depth_compare(depthOps[(test >> 17) & 3u]);
 
+                bool blendMapped = true;
                 if (abe)
-                    applyBlend(*cmd, batch.regs.alpha[ctx]);
+                    blendMapped = applyBlend(*cmd, batch.regs.alpha[ctx]);
                 else
                     cmd->set_blend_enable(false);
+                // PS2X_NATIVE_BLENDLOG: each distinct unmapped blend once, with the draw that uses it.
+                static const bool blendLog = std::getenv("PS2X_NATIVE_BLENDLOG") != nullptr;
+                if (blendLog && !blendMapped)
+                {
+                    static std::unordered_map<uint64_t, bool> seen;
+                    const uint64_t key = (batch.regs.alpha[ctx] & 0xff000000ffull) ^ (uint64_t(batch.debugTag) << 40);
+                    if (!seen[key])
+                    {
+                        seen[key] = true;
+                        std::fprintf(stderr, "[native-blend] unmapped alpha 0x%llx tag %u prim 0x%llx tex0 0x%llx test 0x%llx verts %zu rgba0 0x%08x\n",
+                                     (unsigned long long)batch.regs.alpha[ctx], batch.debugTag, (unsigned long long)batch.prim,
+                                     (unsigned long long)batch.regs.tex0[ctx], (unsigned long long)test, batch.vertices.size(),
+                                     batch.vertices.front().rgba);
+                    }
+                }
 
                 // FRAME.FBMSK: a fully masked byte disables that channel.
                 const uint32_t fbmsk = uint32_t(batch.regs.frame[ctx] >> 32);
@@ -374,7 +426,8 @@ namespace ps2native
                 const uint32_t tint = debugTint(batch.debugTag);
                 std::memcpy(&pc.misc[1], &tint, sizeof(tint));
                 pc.misc[2] = m == Mode::Overlay ? 0.35f : 0.0f;
-                // PS2X_NATIVE_DEBUGVIEW: magenta = texture missing, cyan = texture all black, yellow = vertices black.
+                // PS2X_NATIVE_DEBUGVIEW: magenta = texture missing, cyan = texture all black, yellow = vertices black,
+                // red = blend equation not mapped (drawn opaque).
                 static const bool debugView = std::getenv("PS2X_NATIVE_DEBUGVIEW") != nullptr;
                 if (debugView)
                 {
@@ -385,6 +438,8 @@ namespace ps2native
                         flag = 0xffffff00u;
                     else if (std::all_of(batch.vertices.begin(), batch.vertices.end(), [](const Vertex &v) { return (v.rgba & 0x00ffffffu) == 0u; }))
                         flag = 0xff00ffffu;
+                    else if (!blendMapped)
+                        flag = 0xff0000ffu;
                     if (flag)
                     {
                         std::memcpy(&pc.misc[1], &flag, sizeof(flag));

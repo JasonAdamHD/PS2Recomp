@@ -1,7 +1,7 @@
 #version 450
 // GS texture function (TFX/TCC) and alpha test on the GS's byte scale (0x80 = 1.0).
 layout(location = 0) in vec4 vColor;
-layout(location = 1) in vec2 vST;
+layout(location = 1) in vec3 vSTQ;
 layout(location = 0) out vec4 FragColor;
 
 layout(set = 0, binding = 0) uniform sampler2D uTexture;
@@ -12,7 +12,7 @@ layout(push_constant, std430) uniform Constants
     vec4 screen;
     vec4 target;
     vec4 misc;
-    vec4 shade; // x = AREF, y = bits: 0 TME, 1 TCC, 2-3 TFX, 4 ATE, 5-7 ATST, 8-9 AFAIL, 10 FBA
+    vec4 shade; // x = AREF, y = bits: 0 TME, 1 TCC, 2-3 TFX, 4 ATE, 5-7 ATST, 8-9 AFAIL, 10 FBA, 11 screen-space
 } pc;
 
 bool alphaPasses(float a, uint atst, float aref)
@@ -37,7 +37,7 @@ void main()
     vec4 c = v;
     if ((bits & 1u) != 0u)
     {
-        vec4 t = floor(texture(uTexture, vST) * 255.0 + 0.5);
+        vec4 t = floor(texture(uTexture, vSTQ.xy / vSTQ.z) * 255.0 + 0.5);
         bool tcc = (bits & 2u) != 0u;
         uint tfx = (bits >> 2) & 3u;
         if (tfx == 0u) // MODULATE

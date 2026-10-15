@@ -2472,7 +2472,10 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
         return false;
     if (ps2native::enabled())
+    {
         ps2native::observeGif(0u, payload, payloadBytes); // bypassed the GIF arbiter as well
+        ps2native::replayGif(0u, payload, payloadBytes);
+    }
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;

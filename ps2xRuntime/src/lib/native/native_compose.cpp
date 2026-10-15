@@ -256,7 +256,7 @@ namespace ps2native
             cmd->set_primitive_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
             cmd->set_vertex_attrib(0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, pos));
             cmd->set_vertex_attrib(1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(Vertex, rgba));
-            cmd->set_vertex_attrib(2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, st));
+            cmd->set_vertex_attrib(2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, st)); // st + q
 
             for (const Batch &batch : frame->batches)
             {
@@ -304,7 +304,17 @@ namespace ps2native
                 pc.target[1] = float((xyoffset >> 32) & 0xffffu);
                 pc.target[2] = 1.0f / float(width);
                 pc.target[3] = 1.0f / float(height);
-                pc.misc[0] = batch.depthScale / depthRange(batch.regs.zbuf[ctx]);
+                pc.misc[0] = batch.screenSpace ? 1.0f / depthRange(batch.regs.zbuf[ctx])
+                                               : batch.depthScale / depthRange(batch.regs.zbuf[ctx]);
+                // GS scissor (window pixels of the frame buffer).
+                const uint64_t sc = batch.regs.scissor[ctx];
+                const int sx0 = int(sc & 0x7ffu), sx1 = int((sc >> 16) & 0x7ffu), sy0 = int((sc >> 32) & 0x7ffu), sy1 = int((sc >> 48) & 0x7ffu);
+                VkRect2D scissor{};
+                scissor.offset.x = std::min(sx0, int(width));
+                scissor.offset.y = std::min(sy0, int(height));
+                scissor.extent.width = uint32_t(std::max(0, std::min(sx1 + 1, int(width)) - scissor.offset.x));
+                scissor.extent.height = uint32_t(std::max(0, std::min(sy1 + 1, int(height)) - scissor.offset.y));
+                cmd->set_scissor(scissor);
                 const uint32_t tint = debugTint(batch.debugTag);
                 std::memcpy(&pc.misc[1], &tint, sizeof(tint));
                 pc.misc[2] = m == Mode::Overlay ? 0.35f : 0.0f;
@@ -335,6 +345,7 @@ namespace ps2native
                 bits |= uint32_t((test >> 1) & 7u) << 5;           // ATST
                 bits |= uint32_t((test >> 12) & 3u) << 8;          // AFAIL
                 bits |= uint32_t(batch.regs.fba[ctx] & 1u) << 10;  // FBA
+                bits |= uint32_t(batch.screenSpace) << 11;
                 pc.shade[0] = float((test >> 4) & 0xffu);          // AREF
                 std::memcpy(&pc.shade[1], &bits, sizeof(bits));
                 cmd->push_constants(&pc, 0, sizeof(pc));
@@ -348,9 +359,23 @@ namespace ps2native
         }
         cmd->end_render_pass();
 
-        cmd->image_barrier(*color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                           VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        // PS2X_NATIVE_SPLIT: left half from the emulated scanout, right half native (same frame, for comparison).
+        static const bool split = std::getenv("PS2X_NATIVE_SPLIT") != nullptr;
+        if (split && m != Mode::Overlay)
+        {
+            cmd->image_barrier(*color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            const VkImageSubresourceLayers layers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            cmd->copy_image(*color, *scanout.image, {0, 0, 0}, {0, 0, 0}, {width / 2u, height, 1u}, layers, layers);
+            cmd->image_barrier(*color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        }
+        else
+            cmd->image_barrier(*color, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
         device.submit(cmd);
         evictTextures();
 

@@ -20,6 +20,9 @@ namespace ps2native
             uint32_t displayFbps[4]{};
             unsigned displayCount = 0;
             uint32_t lastFbp = ~0u;
+            // Games that draw into an off-screen page and copy it to the display: the page being copied.
+            uint32_t drawFbp = ~0u;
+            bool copyObserved = false;
             Stats stats;
 
             bool isDisplay(uint32_t fbp) const
@@ -67,6 +70,8 @@ namespace ps2native
                 return Mode::Only;
             case 3:
                 return Mode::Replace;
+            case 4:
+                return Mode::Full;
             default:
                 return Mode::Off;
             }
@@ -79,7 +84,7 @@ namespace ps2native
         auto &s = state();
         const uint32_t fbp = uint32_t(batch.regs.frame[(batch.prim >> 9) & 1] & 0x1ffu);
         std::lock_guard<std::mutex> lock(s.mutex);
-        if (s.lastFbp != ~0u && fbp != s.lastFbp)
+        if (s.lastFbp != ~0u && fbp != s.lastFbp && !s.copyObserved)
         {
             // Until presentation has reported the display buffers, any switch ends the frame.
             const bool knownDisplays = s.displayCount >= 2;
@@ -107,9 +112,24 @@ namespace ps2native
     {
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        // A draw into a display page from another page's frame is the copy that presents it.
-        if (s.lastFbp != ~0u && fbp != s.lastFbp && s.isDisplay(fbp) && !s.isDisplay(s.lastFbp))
-            s.close(s.lastFbp, fbp);
+        // A draw into a display page from another page's frame is the copy that presents it. Once seen, frames
+        // end only at the copy and the copied page is the draw buffer (render targets in between are ignored).
+        const uint32_t source = s.copyObserved ? s.drawFbp : s.lastFbp;
+        if (source != ~0u && fbp != source && s.isDisplay(fbp) && !s.isDisplay(source))
+        {
+            s.close(source, fbp);
+            s.copyObserved = true;
+            s.drawFbp = source;
+        }
+    }
+
+    bool isDrawBuffer(uint32_t fbp)
+    {
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (s.isDisplay(fbp))
+            return false;
+        return s.drawFbp == ~0u || fbp == s.drawFbp;
     }
 
     std::shared_ptr<const Frame> frameForDisplay(uint32_t displayFbp)

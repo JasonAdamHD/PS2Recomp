@@ -15,22 +15,28 @@
 namespace ps2native
 {
     // PS2X_NATIVE3D: 0/unset = off, 1 = overlay native 3D on the emulated frame, 2 = native 3D only,
-    // 3 = native 3D only and handled VU1 batches skip the interpreter (no emulated 3D at all).
+    // 3 = native 3D only and handled VU1 batches skip the interpreter (no emulated 3D at all),
+    // 4 = full native frame: as 3, plus every other GS primitive drawn into the frame's buffer is replayed
+    //     natively in stream order (2D, effects, and the output of VU1 programs without a native port).
     enum class Mode : uint8_t
     {
         Off = 0,
         Overlay = 1,
         Only = 2,
         Replace = 3,
+        Full = 4,
     };
     Mode mode();
     inline bool enabled() { return mode() != Mode::Off; }
+    // Handled VU1 batches skip the interpreter.
+    inline bool replacesVu1() { return mode() == Mode::Replace || mode() == Mode::Full; }
 
     struct Vertex
     {
-        float pos[3];  // object space, before the batch matrix
+        float pos[3];  // object space, before the batch matrix (screen-space batches: GS window x, y in 12.4, Z)
         uint32_t rgba; // vertex colour bytes as the GS sees them (0x80 = 1.0)
-        float st[2];
+        float st[2];   // normalised texture coordinates
+        float q = 1.0f; // screen-space batches: texture lookup at st / q (GS STQ)
     };
 
     // A GS texture decoded to RGBA8 (bytes as the GS sees them: alpha 0x80 = 1.0).
@@ -61,6 +67,12 @@ namespace ps2native
     // and return at once; call them before the GS consumes the packet / for the batch being decoded.
     void observeGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
     std::shared_ptr<TextureRequest> requestTexture(uint64_t tex0, uint64_t texa);
+    // Mode::Full: replays the GS primitives of a GIF packet that draw into the native frame as screen-space
+    // batches, in stream order with the VU1 batches. Call before the GS consumes the packet.
+    void replayGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
+    // The current GS drawing registers (the replay starts every packet from them).
+    void setRegisterSource(bool (*source)(GSRawDrawRegisters &out));
+
     // Debug: waits for the texture thread to drain, then reads one pixel of the shadow (GS PSM code).
     uint32_t debugShadowRead(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y);
 
@@ -73,6 +85,7 @@ namespace ps2native
         uint64_t prim = 0;       // PRIM the GS would use for this batch
         GSRawDrawRegisters regs{};
         uint32_t debugTag = 0; // identifies the source microprogram (debug colouring)
+        bool screenSpace = false; // vertices are already GS window coordinates (replayed GS primitives)
         std::shared_ptr<TextureRequest> texture; // null when PRIM.TME is off
         std::vector<Vertex> vertices;
         std::vector<uint16_t> indices; // triangle list
@@ -83,6 +96,9 @@ namespace ps2native
     // Reports a GS primitive drawn (not through the native path) into framebuffer page fbp. Games that render
     // into an off-screen page and copy it to the display page use this to mark the end of the frame.
     void noteGsDraw(uint32_t fbp);
+    // Whether framebuffer page fbp is the one the native frame is drawn into (not a display page or a render
+    // target). True for anything but display pages until the game's buffer setup has been observed.
+    bool isDrawBuffer(uint32_t fbp);
 
     struct Frame
     {

@@ -6,18 +6,22 @@
 
 #include "runtime/gs/gs_backend.h"
 
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <memory>
 #include <vector>
 
 namespace ps2native
 {
-    // PS2X_NATIVE3D: 0/unset = off, 1 = overlay native 3D on the emulated frame, 2 = native 3D only.
+    // PS2X_NATIVE3D: 0/unset = off, 1 = overlay native 3D on the emulated frame, 2 = native 3D only,
+    // 3 = native 3D only and handled VU1 batches skip the interpreter (no emulated 3D at all).
     enum class Mode : uint8_t
     {
         Off = 0,
         Overlay = 1,
         Only = 2,
+        Replace = 3,
     };
     Mode mode();
     inline bool enabled() { return mode() != Mode::Off; }
@@ -29,6 +33,37 @@ namespace ps2native
         float st[2];
     };
 
+    // A GS texture decoded to RGBA8 (bytes as the GS sees them: alpha 0x80 = 1.0).
+    struct Texture
+    {
+        uint64_t serial = 0; // unique per decode; the presenter caches GPU images by it
+        uint32_t width = 0, height = 0;
+        bool black = false; // every texel has RGB 0 (debug view)
+        std::vector<uint32_t> rgba;
+    };
+
+    // A texture a batch samples, resolved asynchronously by the texture thread.
+    class TextureRequest
+    {
+    public:
+        // Blocks until the texture thread has decoded it; null when the format is unsupported.
+        std::shared_ptr<const Texture> wait();
+        void resolve(std::shared_ptr<const Texture> texture);
+
+    private:
+        std::mutex mutex_;
+        std::condition_variable ready_;
+        bool done_ = false;
+        std::shared_ptr<const Texture> texture_;
+    };
+
+    // The texture thread keeps a CPU shadow of GS local memory. Both calls queue work for it in stream order
+    // and return at once; call them before the GS consumes the packet / for the batch being decoded.
+    void observeGif(uint32_t path, const uint8_t *data, uint32_t sizeBytes);
+    std::shared_ptr<TextureRequest> requestTexture(uint64_t tex0, uint64_t texa);
+    // Debug: waits for the texture thread to drain, then reads one pixel of the shadow (GS PSM code).
+    uint32_t debugShadowRead(uint32_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y);
+
     struct Batch
     {
         float objectToClip[16]{}; // column-major: clip = M * (pos, 1)
@@ -38,6 +73,7 @@ namespace ps2native
         uint64_t prim = 0;       // PRIM the GS would use for this batch
         GSRawDrawRegisters regs{};
         uint32_t debugTag = 0; // identifies the source microprogram (debug colouring)
+        std::shared_ptr<TextureRequest> texture; // null when PRIM.TME is off
         std::vector<Vertex> vertices;
         std::vector<uint16_t> indices; // triangle list
     };

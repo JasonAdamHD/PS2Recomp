@@ -403,6 +403,7 @@ add_library(ps2_runtime STATIC
     src/lib/vu/ps2_vu1_lower.cpp
     src/lib/games_database.cpp
     src/lib/native/native_renderer.cpp
+    src/lib/native/native_textures.cpp
 )
 
 if(PS2X_GS_BACKEND STREQUAL "PARALLEL_GS")

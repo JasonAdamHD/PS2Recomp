@@ -563,6 +563,12 @@ namespace GSMem
 
 	void WriteNull(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 
+	// Writes count pixels of row y starting at x (wrapping at 2048) in format psm (GS PSM code); values hold one
+	// pixel each. Much faster than per-pixel calls for host->local transfers. Returns false for unknown formats.
+	bool WriteRow(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count);
+	// Reads count pixels of row y starting at x (no wrap) into out. Returns false for unknown formats.
+	bool ReadRow(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32* out, u32 count);
+
 	u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 	u32 ReadZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y);
 

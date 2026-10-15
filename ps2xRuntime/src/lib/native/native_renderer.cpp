@@ -65,6 +65,8 @@ namespace ps2native
                 return Mode::Overlay;
             case 2:
                 return Mode::Only;
+            case 3:
+                return Mode::Replace;
             default:
                 return Mode::Off;
             }

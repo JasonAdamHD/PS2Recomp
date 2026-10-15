@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <chrono>
 #include "runtime/ps2_memory.h"
+#include "runtime/native/native_renderer.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
@@ -2377,6 +2378,22 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;
     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+    if (ps2native::enabled())
+    {
+        // This fast path bypasses the GIF arbiter; give the native texture shadow the equivalent packet.
+        std::vector<uint8_t> packet(16u * 6u + imageBytes);
+        const uint64_t setTag[2] = {4ull | (1ull << 60), 0xEull};
+        const uint64_t imageTag[2] = {uint64_t(imageQwc & 0x7fffu) | (1ull << 15) | (2ull << 58), 0ull};
+        std::memcpy(packet.data(), setTag, 16);
+        for (uint32_t i = 0; i < 4u; ++i)
+        {
+            const uint64_t ad[2] = {setupRegs[i], 0x50ull + i};
+            std::memcpy(packet.data() + 16u * (1u + i), ad, 16);
+        }
+        std::memcpy(packet.data() + 16u * 5u, imageTag, 16);
+        std::memcpy(packet.data() + 16u * 6u, imageData, imageBytes);
+        ps2native::observeGif(0u, packet.data(), uint32_t(packet.size()));
+    }
     gs.uploadImageNative(setupRegs[0], setupRegs[1], setupRegs[2], setupRegs[3], imageData, imageBytes);
 
     m_ioRegisters[GIF_CHANNEL + 0x30u] = finalTadr;
@@ -2454,6 +2471,8 @@ bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t c
         return false;
     if (!gs.processNativePackedGIFPacket(payload, payloadBytes))
         return false;
+    if (ps2native::enabled())
+        ps2native::observeGif(0u, payload, payloadBytes); // bypassed the GIF arbiter as well
 
     m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
     m_seenGifCopy = true;

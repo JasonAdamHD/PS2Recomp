@@ -324,6 +324,66 @@ namespace GSMem
     {
     }
 
+    namespace
+    {
+        template <PixelStorageMode psm, typename Table>
+        void writeRow(const Table &table, u8 *data, u32 bp, u32 bw, u32 x, u32 y, const u32 *values, u32 count)
+        {
+            using Packed = typename PixelStorageTraits<psm>::PackedT;
+            for (u32 i = 0; i < count; ++i)
+                PixelStorageTraits<psm>::Write(table, data, bp, bw, (x + i) & 2047u, y, static_cast<Packed>(values[i]));
+        }
+
+        template <PixelStorageMode psm, typename Table>
+        void readRow(const Table &table, u8 *data, u32 bp, u32 bw, u32 x, u32 y, u32 *out, u32 count)
+        {
+            for (u32 i = 0; i < count; ++i)
+                out[i] = static_cast<u32>(PixelStorageTraits<psm>::Read(table, data, bp, bw, x + i, y));
+        }
+    }
+
+    bool WriteRow(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, const u32* values, u32 count)
+    {
+        switch (psm)
+        {
+        case 0x00: writeRow<C32>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case 0x01: writeRow<C24>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case 0x02: writeRow<C16>(PageTableC16, data, bp, bw, x, y, values, count); return true;
+        case 0x0A: writeRow<C16S>(PageTableC16S, data, bp, bw, x, y, values, count); return true;
+        case 0x13: writeRow<P8>(PageTableP8, data, bp, bw, x, y, values, count); return true;
+        case 0x14: writeRow<P4>(PageTableP4, data, bp, bw, x, y, values, count); return true;
+        case 0x1B: writeRow<P8H>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case 0x24: writeRow<P4HL>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case 0x2C: writeRow<P4HH>(PageTableC32, data, bp, bw, x, y, values, count); return true;
+        case 0x30: writeRow<Z32>(PageTableZ32, data, bp, bw, x, y, values, count); return true;
+        case 0x31: writeRow<Z24>(PageTableZ32, data, bp, bw, x, y, values, count); return true;
+        case 0x32: writeRow<Z16>(PageTableZ16, data, bp, bw, x, y, values, count); return true;
+        case 0x3A: writeRow<Z16S>(PageTableZ16S, data, bp, bw, x, y, values, count); return true;
+        default: return false;
+        }
+    }
+
+    bool ReadRow(u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y, u32* out, u32 count)
+    {
+        switch (psm)
+        {
+        case 0x00: readRow<C32>(PageTableC32, data, bp, bw, x, y, out, count); return true;
+        case 0x01: readRow<C24>(PageTableC32, data, bp, bw, x, y, out, count); return true;
+        case 0x02: readRow<C16>(PageTableC16, data, bp, bw, x, y, out, count); return true;
+        case 0x0A: readRow<C16S>(PageTableC16S, data, bp, bw, x, y, out, count); return true;
+        case 0x13: readRow<P8>(PageTableP8, data, bp, bw, x, y, out, count); return true;
+        case 0x14: readRow<P4>(PageTableP4, data, bp, bw, x, y, out, count); return true;
+        case 0x1B: readRow<P8H>(PageTableC32, data, bp, bw, x, y, out, count); return true;
+        case 0x24: readRow<P4HL>(PageTableC32, data, bp, bw, x, y, out, count); return true;
+        case 0x2C: readRow<P4HH>(PageTableC32, data, bp, bw, x, y, out, count); return true;
+        case 0x30: readRow<Z32>(PageTableZ32, data, bp, bw, x, y, out, count); return true;
+        case 0x31: readRow<Z24>(PageTableZ32, data, bp, bw, x, y, out, count); return true;
+        case 0x32: readRow<Z16>(PageTableZ16, data, bp, bw, x, y, out, count); return true;
+        case 0x3A: readRow<Z16S>(PageTableZ16S, data, bp, bw, x, y, out, count); return true;
+        default: return false;
+        }
+    }
+
     u32 ReadCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y)
     {
         return PixelStorageTraits<C32>::Read(PageTableC32, data, bp, bw, x, y);

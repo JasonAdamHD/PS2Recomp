@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Pad.h"
+#include "runtime/ps2_netplay.h"
 
 namespace ps2_stubs
 {
@@ -266,6 +267,44 @@ namespace ps2_stubs
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
+        // This machine's controller as pad port 1 sees it (backend: gamepad and scripted presses; else raylib
+        // gamepad and keyboard). Netplay and input recording sample it once per vsync tick.
+        bool sampleLocalPad(PS2Runtime &runtime, ps2netplay::PadInput &out)
+        {
+            bool analog = false;
+            {
+                std::lock_guard<std::mutex> lock(g_padStateMutex);
+                analog = g_padPorts[0].analogMode;
+            }
+            PadInputState state;
+            uint8_t backendData[32]{};
+            if (runtime.padBackend().readState(0, 0, backendData, sizeof(backendData)))
+            {
+                state.buttons = static_cast<uint16_t>(backendData[2] | (backendData[3] << 8));
+                state.rx = backendData[4];
+                state.ry = backendData[5];
+                state.lx = backendData[6];
+                state.ly = backendData[7];
+            }
+            else
+            {
+                applyGamepadState(state);
+                applyKeyboardState(state, analog);
+            }
+            out.buttons = state.buttons;
+            out.rx = state.rx;
+            out.ry = state.ry;
+            out.lx = state.lx;
+            out.ly = state.ly;
+            return true;
+        }
+
+        const bool g_netplaySamplerRegistered = []
+        {
+            ps2netplay::setLocalSampler(&sampleLocalPad);
+            return true;
+        }();
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -296,6 +335,20 @@ namespace ps2_stubs
             }
 
             bool usedBackend = false;
+            if (ps2netplay::deterministic())
+            {
+                // Frame-locked input (netplay / record / replay): the same on every machine.
+                ps2netplay::PadInput in;
+                if (ps2netplay::portInput(port, in))
+                {
+                    state.buttons = in.buttons;
+                    state.rx = in.rx;
+                    state.ry = in.ry;
+                    state.lx = in.lx;
+                    state.ly = in.ly;
+                }
+                useOverride = true;
+            }
             if (!useOverride)
             {
                 uint8_t backendData[32]{};

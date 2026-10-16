@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"
 #include "runtime/native/native_renderer.h"
 #include "ps2_runtime.h"
 #include "ps2_log.h"
@@ -36,6 +37,8 @@
 
 extern bool g_ps2BranchDeferred; // defined with PS2Runtime::eeCheckpointDue
 
+extern std::atomic<uint64_t> g_ps2GuestEeCycle; // EeScheduler.cpp
+
 namespace
 {
     // COP0 Count runs at the EE core clock (294.912 MHz). It is derived from the host clock so
@@ -46,6 +49,11 @@ namespace
 
     uint32_t elapsedEeCycles() noexcept
     {
+        // Netplay / replay: guest cycles, identical on every machine (guest busy-waits still advance them).
+        if (ps2netplay::deterministic())
+        {
+            return static_cast<uint32_t>(g_ps2GuestEeCycle.load(std::memory_order_relaxed));
+        }
         const auto elapsed = std::chrono::steady_clock::now() - g_cop0CountEpoch;
         const auto nanoseconds = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
         return static_cast<uint32_t>((nanoseconds / 1000ull) * (kEeClockHz / 1'000'000ull) +
@@ -1275,6 +1283,23 @@ void PS2Runtime::setIoPaths(const IoPaths &paths)
     }
 
     runtimeIoPaths() = normalized;
+}
+
+namespace
+{
+    // Netplay redirects the memory card to a session copy of the host's card.
+    const bool g_netplayCardAccessRegistered = []
+    {
+        ps2netplay::setMemoryCardAccess(
+            []() { return PS2Runtime::getIoPaths().mcRoot; },
+            [](const std::filesystem::path &root)
+            {
+                PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+                paths.mcRoot = root;
+                PS2Runtime::setIoPaths(paths);
+            });
+        return true;
+    }();
 }
 
 void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)

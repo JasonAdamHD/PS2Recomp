@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"
 #include "Common.h"
 #include "CD.h"
 #include "MPEG.h"
@@ -517,7 +518,8 @@ namespace ps2_stubs
             return;
         }
 
-        std::time_t now = std::time(nullptr);
+        // Netplay / replay: a clock every player agrees on.
+        std::time_t now = ps2netplay::clock(std::time(nullptr));
         std::tm localTm{};
 #ifdef _WIN32
         localtime_s(&localTm, &now);

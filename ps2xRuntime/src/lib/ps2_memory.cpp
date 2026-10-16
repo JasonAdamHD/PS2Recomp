@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"
 #include <functional>
 #include <deque>
 #include <condition_variable>
@@ -328,6 +329,9 @@ bool PS2Memory::graphicsWorkerEnabled() const
     // On by default; PS2X_GFX_THREAD=0 keeps all GIF/VIF1/VU1 work on the EE thread.
     static const bool enabled = []
     {
+        // Netplay / replay keep graphics on the EE thread: DMA completion must not depend on host thread timing.
+        if (ps2netplay::deterministic())
+            return false;
         const char *value = std::getenv("PS2X_GFX_THREAD");
         return value == nullptr || value[0] != '0';
     }();

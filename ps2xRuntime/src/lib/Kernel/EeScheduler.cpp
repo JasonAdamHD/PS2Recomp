@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"
 #include "runtime/ee_scheduler.h"
 
 #include "ps2_log.h"
@@ -428,7 +429,8 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     // EE cycles, and vsync - which waits for both the cycle deadline and the host deadline - falls far behind
     // the wall clock. Every 1024 checkpoints, if the next deadline's host time has passed, advance the EE
     // clock (and with it the IOP and timers) to that deadline. PS2X_NO_CATCHUP=1 disables this.
-    static const bool catchUpEnabled = std::getenv("PS2X_NO_CATCHUP") == nullptr;
+    // Netplay and input replay need guest time to depend only on guest work, so they never catch up.
+    static const bool catchUpEnabled = std::getenv("PS2X_NO_CATCHUP") == nullptr && !ps2netplay::deterministic();
     static uint32_t catchUpCounter = 0u;
     if (catchUpEnabled && (++catchUpCounter & 0x3FFu) == 0u)
     {
@@ -487,10 +489,14 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+// Guest EE cycles, for the COP0 Count register in deterministic (netplay / replay) mode.
+std::atomic<uint64_t> g_ps2GuestEeCycle{0u};
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
+    g_ps2GuestEeCycle.store(m_eeCycle, std::memory_order_relaxed);
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
     m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)
@@ -1881,23 +1887,42 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
+            // Netplay / replay: events fire purely on guest cycles, so the guest never runs past a deadline while
+            // waiting for the host clock. Host pacing then only holds the EE at vblank, which the guest cannot see.
+            const bool deterministic = ps2netplay::deterministic();
+            bool anyDue = false;
             for (const ScheduledEvent &item : m_deadlines)
             {
-                if (item.deadlineCycle <= m_eeCycle &&
-                    (pacingDeadline == std::chrono::steady_clock::time_point{} ||
-                     item.hostDeadline < pacingDeadline))
-                {
+                if (item.deadlineCycle > m_eeCycle)
+                    continue;
+                anyDue = true;
+                if (deterministic && item.event.type != EeEventType::VBlankStart)
+                    continue;
+                if (pacingDeadline == std::chrono::steady_clock::time_point{} || item.hostDeadline < pacingDeadline)
                     pacingDeadline = item.hostDeadline;
-                }
             }
 
-            if (pacingDeadline == std::chrono::steady_clock::time_point{})
+            if (!anyDue)
             {
                 updateNextDeadline();
                 return;
             }
 
-            if (now < pacingDeadline)
+            if (deterministic)
+            {
+                if (pacingDeadline != std::chrono::steady_clock::time_point{} && now < pacingDeadline)
+                {
+                    SchedulerWaitScope pacingWaitScope;
+                    m_eventCv.wait_until(lock, pacingDeadline, [this]()
+                                         { return m_stopRequested.load(std::memory_order_acquire); });
+                    if (m_stopRequested.load(std::memory_order_acquire))
+                    {
+                        updateNextDeadline();
+                        return;
+                    }
+                }
+            }
+            else if (now < pacingDeadline)
             {
                 SchedulerWaitScope pacingWaitScope;
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
@@ -1912,9 +1937,9 @@ void EeScheduler::processDueDeadlines()
 
             const auto pacedNow = std::chrono::steady_clock::now();
             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
-                                              [this, pacedNow](const ScheduledEvent &item)
+                                              [this, pacedNow, deterministic](const ScheduledEvent &item)
                                               { return item.deadlineCycle <= m_eeCycle &&
-                                                       item.hostDeadline <= pacedNow; });
+                                                       (deterministic || item.hostDeadline <= pacedNow); });
             due.insert(due.end(),
                        std::make_move_iterator(m_deadlines.begin()),
                        std::make_move_iterator(firstFuture));
@@ -1968,6 +1993,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        // Netplay: exchange and latch this tick's pad inputs (may wait for the other players).
+        ps2netplay::onVBlank(m_runtime, m_runtime.memory().getRDRAM(), m_vsyncTick);
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
@@ -2126,6 +2153,24 @@ void EeScheduler::waitForEvent()
                                            });
         deadlineCycle = next->deadlineCycle;
         hostDeadline = next->hostDeadline;
+    }
+    if (ps2netplay::deterministic())
+    {
+        // Netplay / replay: idle time skips straight to the next guest deadline, chosen by cycles alone (real-time
+        // pacing happens at vblank in processDueDeadlines, where the guest cannot observe it).
+        if (hasTimerDeadline && (deadlineCycle == 0u || m_eeCycle + timerCycles < deadlineCycle))
+            deadlineCycle = m_eeCycle + timerCycles;
+        const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
+        lock.unlock();
+        uint64_t remaining = elapsed;
+        while (remaining > 0u)
+        {
+            const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
+            accountCycles(step);
+            remaining -= step;
+        }
+        m_checkpointPending.store(true, std::memory_order_release);
+        return;
     }
     if (hasTimerDeadline)
     {

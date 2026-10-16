@@ -1,3 +1,4 @@
+#include "runtime/ps2_netplay.h"
 #include "Common.h"
 #include "MemoryCard.h"
 
@@ -764,7 +765,10 @@ namespace ps2_stubs
                     if (std::filesystem::exists(hostDir, ec) && !ec &&
                         std::filesystem::is_directory(hostDir, ec))
                     {
-                        const std::time_t now = std::time(nullptr);
+                        // Netplay / replay: fixed times for every player (file times differ between machines, and
+                        // a time that moves makes the game report "data has changed on memory card").
+                        constexpr std::time_t kFixedCardTime = 1767225600; // 2026-01-01 00:00 UTC
+                        const std::time_t now = ps2netplay::deterministic() ? kFixedCardTime : std::time(nullptr);
                         auto appendSpecial = [&](const std::string &name)
                         {
                             if (!wildcardMatch(pattern, name))
@@ -811,7 +815,9 @@ namespace ps2_stubs
                             const uint32_t sizeBytes =
                                 isDirectory ? 0u : static_cast<uint32_t>(entry.file_size(entryEc));
                             entryEc.clear();
-                            const std::time_t modifiedTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
+                            const std::time_t modifiedTime = ps2netplay::deterministic()
+                                                                 ? now
+                                                                 : fileTimeToTimeTMc(entry.last_write_time(entryEc));
                             SceMcTblGetDir tableEntry{};
                             fillMcDirTableEntry(tableEntry,
                                                 name,

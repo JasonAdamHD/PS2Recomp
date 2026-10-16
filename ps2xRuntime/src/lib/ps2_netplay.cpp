@@ -675,8 +675,8 @@ namespace ps2netplay
                 }
                 if (s.role == Role::Host)
                 {
-                    // Pad ports 3-4 need the multitap, which the runtime does not emulate yet: 2 players for now.
-                    s.players = std::clamp(envInt("PS2X_NETPLAY_PLAYERS", 2), 2, 2);
+                    // Players 1-4 sit in the multitap slots of pad port 1.
+                    s.players = std::clamp(envInt("PS2X_NETPLAY_PLAYERS", 2), 2, kMaxPlayers);
                     s.delay = std::clamp(envInt("PS2X_NETPLAY_DELAY", 3), 1, 30);
                     s.presentMask = uint8_t((1u << s.players) - 1u);
                     s.hostAddress.sin_port = htons(port);

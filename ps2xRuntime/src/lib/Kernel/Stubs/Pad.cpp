@@ -15,7 +15,7 @@ namespace ps2_stubs
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
         constexpr size_t kPadPortCount = 2;
-        constexpr size_t kPadSlotCount = 1;
+        constexpr size_t kPadSlotCount = 4; // multitap slots (port 1 only; see multitapActive)
 
         constexpr uint16_t kPadBtnSelect = 1u << 0;
         constexpr uint16_t kPadBtnL3 = 1u << 1;
@@ -65,7 +65,7 @@ namespace ps2_stubs
         std::mutex g_padStateMutex;
         bool g_padOverrideEnabled = false;
         PadInputState g_padOverrideState{};
-        PadPortState g_padPorts[kPadPortCount]{};
+        PadPortState g_padPorts[kPadPortCount * kPadSlotCount]{};
         int g_padReadLogCount = 0;
 
         uint8_t axisToByte(float axis)
@@ -211,7 +211,7 @@ namespace ps2_stubs
             {
                 return nullptr;
             }
-            return &g_padPorts[port];
+            return &g_padPorts[static_cast<size_t>(port) * kPadSlotCount + static_cast<size_t>(slot)];
         }
 
         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
@@ -305,6 +305,64 @@ namespace ps2_stubs
             return true;
         }();
 
+        // A multitap in pad port 1 gives players 1-4 slots 0-3 (PS2X_MULTITAP=0 turns it off: players 1-2 then
+        // use ports 1 and 2, slot 0). Netplay always uses it, so player N is slot N-1 everywhere.
+        bool multitapActive()
+        {
+            static const bool active = []
+            {
+                const char *env = std::getenv("PS2X_MULTITAP");
+                return ps2netplay::deterministic() || !env || env[0] != '0';
+            }();
+            return active;
+        }
+
+        // The player a pad (port, slot) belongs to, or -1 for an empty socket.
+        int playerForPad(int port, int slot)
+        {
+            if (multitapActive())
+                return port == 0 ? slot : -1;
+            return slot == 0 ? port : -1;
+        }
+
+        // Is a controller plugged into this socket? Netplay: the session's players. Locally: slot 0 always (keyboard
+        // and the first gamepad), other players when a gamepad with their number is connected.
+        bool padPresent(int port, int slot)
+        {
+            const int player = playerForPad(port, slot);
+            if (player < 0)
+                return false;
+            if (ps2netplay::deterministic())
+            {
+                ps2netplay::PadInput unused;
+                return ps2netplay::portInput(player, unused);
+            }
+            if (player == 0 || !multitapActive())
+                return true;
+            return IsWindowReady() && IsGamepadAvailable(player);
+        }
+
+        void applyGamepadIndex(PadInputState &state, int gamepad)
+        {
+            if (!IsWindowReady() || !IsGamepadAvailable(gamepad))
+                return;
+            state.lx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X));
+            state.ly = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
+            state.rx = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X));
+            state.ry = axisToByte(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
+            const std::pair<int, uint16_t> buttons[] = {
+                {GAMEPAD_BUTTON_LEFT_FACE_UP, kPadBtnUp}, {GAMEPAD_BUTTON_LEFT_FACE_DOWN, kPadBtnDown},
+                {GAMEPAD_BUTTON_LEFT_FACE_LEFT, kPadBtnLeft}, {GAMEPAD_BUTTON_LEFT_FACE_RIGHT, kPadBtnRight},
+                {GAMEPAD_BUTTON_RIGHT_FACE_DOWN, kPadBtnCross}, {GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, kPadBtnCircle},
+                {GAMEPAD_BUTTON_RIGHT_FACE_LEFT, kPadBtnSquare}, {GAMEPAD_BUTTON_RIGHT_FACE_UP, kPadBtnTriangle},
+                {GAMEPAD_BUTTON_LEFT_TRIGGER_1, kPadBtnL1}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_1, kPadBtnR1},
+                {GAMEPAD_BUTTON_LEFT_TRIGGER_2, kPadBtnL2}, {GAMEPAD_BUTTON_RIGHT_TRIGGER_2, kPadBtnR2},
+                {GAMEPAD_BUTTON_LEFT_THUMB, kPadBtnL3}, {GAMEPAD_BUTTON_RIGHT_THUMB, kPadBtnR3},
+                {GAMEPAD_BUTTON_MIDDLE_LEFT, kPadBtnSelect}, {GAMEPAD_BUTTON_MIDDLE_RIGHT, kPadBtnStart}};
+            for (const auto &[button, mask] : buttons)
+                setButton(state, mask, IsGamepadButtonDown(gamepad, button));
+        }
+
         bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
         {
             if (!outData)
@@ -339,7 +397,7 @@ namespace ps2_stubs
             {
                 // Frame-locked input (netplay / record / replay): the same on every machine.
                 ps2netplay::PadInput in;
-                if (ps2netplay::portInput(port, in))
+                if (ps2netplay::portInput(playerForPad(port, slot), in))
                 {
                     state.buttons = in.buttons;
                     state.rx = in.rx;
@@ -347,6 +405,12 @@ namespace ps2_stubs
                     state.lx = in.lx;
                     state.ly = in.ly;
                 }
+                useOverride = true;
+            }
+            if (!useOverride && multitapActive() && port == 0 && slot > 0)
+            {
+                // Local players 2-4 on the multitap: gamepads 2-4.
+                applyGamepadIndex(state, slot);
                 useOverride = true;
             }
             if (!useOverride)
@@ -478,6 +542,11 @@ namespace ps2_stubs
         setReturnS32(ctx, 0x0200);
     }
 
+    bool padMultitapConnected(int port)
+    {
+        return multitapActive() && port == 0;
+    }
+
     void scePadGetPortMax(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
@@ -499,8 +568,8 @@ namespace ps2_stubs
     {
         (void)rdram;
         (void)runtime;
-        // Most games use one slot unless multitap is active.
-        setReturnS32(ctx, 1);
+        // Four slots behind the multitap in port 1.
+        setReturnS32(ctx, (multitapActive() && getRegU32(ctx, 4) == 0u) ? 4 : 1);
     }
 
     void scePadGetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -511,7 +580,8 @@ namespace ps2_stubs
         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
                                                            static_cast<int>(getRegU32(ctx, 5)));
         int32_t state = kPadStateDisconnected;
-        if (portState && portState->open)
+        if (portState && portState->open &&
+            padPresent(static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5))))
         {
             if (portState->transientState != 0u)
             {
@@ -913,4 +983,9 @@ namespace ps2_stubs
         g_padOverrideEnabled = false;
         g_padOverrideState = PadInputState{};
     }
+}
+
+bool ps2PadMultitapConnected(int port)
+{
+    return ps2_stubs::padMultitapConnected(port);
 }

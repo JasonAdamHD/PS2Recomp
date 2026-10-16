@@ -7,7 +7,7 @@
 //
 //   PS2X_NETPLAY=host[:port]              host a session (default port 7777)
 //   PS2X_NETPLAY=join:<address>[:port]    join one
-//   PS2X_NETPLAY_PLAYERS=2                players in the host's session (pad ports 1..N; 3-4 need multitap)
+//   PS2X_NETPLAY_PLAYERS=<2..4>           players in the host's session (multitap slots 1..N; default 2)
 //   PS2X_NETPLAY_DELAY=<frames>           input delay in vsync ticks (default 3; host decides)
 //   PS2X_INPUT_RECORD=<file> / PS2X_INPUT_REPLAY=<file>   frame-locked single-player input recording (testing)
 //   PS2X_FRAMEHASH=<ticks>                log a hash of EE RAM every N ticks (determinism checks)
@@ -35,8 +35,8 @@ namespace ps2netplay
     // checks (32 MB).
     void onVBlank(PS2Runtime &runtime, const uint8_t *rdram, uint64_t tick);
 
-    // The latched input of a pad port for the current tick; false when no player owns the port.
-    bool portInput(int port, PadInput &out);
+    // The latched input of a player (0-3) for the current tick; false when the session has no such player.
+    bool portInput(int player, PadInput &out);
 
     // sceCdReadClock: in deterministic mode, the session start time plus emulated time.
     std::time_t clock(std::time_t hostNow);

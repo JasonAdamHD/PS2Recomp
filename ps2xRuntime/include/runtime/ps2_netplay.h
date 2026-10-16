@@ -8,7 +8,8 @@
 //   PS2X_NETPLAY=host[:port]              host a session (default port 7777)
 //   PS2X_NETPLAY=join:<address>[:port]    join one
 //   PS2X_NETPLAY_PLAYERS=<2..4>           players in the host's session (multitap slots 1..N; default 2)
-//   PS2X_NETPLAY_DELAY=<frames>           input delay in vsync ticks (default 3; host decides)
+//   PS2X_NETPLAY_DELAY=<frames>           input delay in vsync ticks (host; default: chosen from the measured pings)
+//   PS2X_NETPLAY_SIM_PING / _JITTER / _LOSS   simulate this machine's link to the host (ms, ms, percent; testing)
 //   PS2X_INPUT_RECORD=<file> / PS2X_INPUT_REPLAY=<file>   frame-locked single-player input recording (testing)
 //   PS2X_FRAMEHASH=<ticks>                log a hash of EE RAM every N ticks (determinism checks)
 

@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +72,8 @@ namespace ps2netplay
             Bye = 6,     // {player}
             CardRequest = 7, // client -> host: {offset} into the memory card image
             CardChunk = 8,   // host -> client: {total, offset, length, bytes}
+            Ping = 9,        // client -> host: {sent time, us}
+            Pong = 10,       // host -> client: the Ping's payload, echoed
         };
         constexpr uint32_t kCardChunk = 1024u;
 
@@ -172,6 +178,15 @@ namespace ps2netplay
             std::map<uint64_t, uint64_t> localHashes;
             std::map<uint64_t, std::map<int, uint64_t>> remoteHashes; // arrived before ours was computed
             std::vector<PadInput> localHistory; // local input by tick (index = tick), for redundant sends
+
+            // Statistics, logged every 600 ticks (10 s of game time).
+            uint64_t rttSumUs = 0, rttCount = 0;
+            std::array<uint64_t, kMaxPlayers> probeRttUs{}; // host: each client's round trip (90th percentile)
+            std::array<std::vector<uint64_t>, kMaxPlayers> probeSamples{};
+            bool autoDelay = true;
+            uint32_t statStalls = 0;
+            uint64_t statWaitUs = 0, statMaxWaitUs = 0;
+            std::chrono::steady_clock::time_point statStart{};
             bool (*sampler)(PS2Runtime &, PadInput &) = nullptr;
 
             // Sockets (Host / Client).
@@ -199,6 +214,11 @@ namespace ps2netplay
             static State s;
             return s;
         }
+
+        // The network thread receives, relays and answers packets as they arrive; the EE thread works on the same
+        // state under this lock and waits on the condition for inputs.
+        std::mutex g_net;
+        std::condition_variable g_netChanged;
 
         void log(const std::string &text)
         {
@@ -247,16 +267,106 @@ namespace ps2netplay
             return ::bind(s.socket, reinterpret_cast<const sockaddr *>(&local), sizeof(local)) == 0;
         }
 
-        void sendTo(const sockaddr_in &to, const Writer &packet)
+        void sendNow(const sockaddr_in &to, const uint8_t *data, size_t size)
         {
-            ::sendto(state().socket, reinterpret_cast<const char *>(packet.bytes.data()), int(packet.bytes.size()), 0,
+            ::sendto(state().socket, reinterpret_cast<const char *>(data), int(size), 0,
                      reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+        }
+
+        // Network conditions for testing (this machine's link to the host): PS2X_NETPLAY_SIM_PING=<round trip ms>
+        // delays every packet sent and received by half of it, PS2X_NETPLAY_SIM_JITTER=<ms> adds +/- that much at
+        // random, PS2X_NETPLAY_SIM_LOSS=<percent> drops packets in both directions.
+        struct LinkSim
+        {
+            using Clock = std::chrono::steady_clock;
+            struct Packet
+            {
+                sockaddr_in address{};
+                std::vector<uint8_t> bytes;
+            };
+            bool enabled = false;
+            int halfMs = 0, jitterMs = 0, lossPercent = 0;
+            std::mt19937 random{0x5eed};
+            std::mutex mutex;
+            std::condition_variable wake;
+            std::multimap<Clock::time_point, Packet> outgoing; // sender thread
+            std::multimap<Clock::time_point, Packet> incoming; // EE thread only
+            std::thread sender;
+
+            LinkSim()
+            {
+                const int ping = envInt("PS2X_NETPLAY_SIM_PING", 0);
+                jitterMs = std::max(0, envInt("PS2X_NETPLAY_SIM_JITTER", 0));
+                lossPercent = std::clamp(envInt("PS2X_NETPLAY_SIM_LOSS", 0), 0, 100);
+                halfMs = std::max(0, ping / 2);
+                enabled = halfMs > 0 || jitterMs > 0 || lossPercent > 0;
+                if (!enabled)
+                    return;
+                log("simulating " + std::to_string(ping) + " ms ping, +/-" + std::to_string(jitterMs) + " ms jitter, " +
+                    std::to_string(lossPercent) + "% loss");
+                sender = std::thread([this]
+                                     {
+                                         std::unique_lock<std::mutex> lock(mutex);
+                                         for (;;)
+                                         {
+                                             if (outgoing.empty())
+                                             {
+                                                 wake.wait(lock);
+                                                 continue;
+                                             }
+                                             const auto due = outgoing.begin()->first;
+                                             if (Clock::now() < due)
+                                             {
+                                                 wake.wait_until(lock, due);
+                                                 continue;
+                                             }
+                                             Packet packet = std::move(outgoing.begin()->second);
+                                             outgoing.erase(outgoing.begin());
+                                             lock.unlock();
+                                             sendNow(packet.address, packet.bytes.data(), packet.bytes.size());
+                                             lock.lock();
+                                         } });
+                sender.detach();
+            }
+
+            bool drop()
+            {
+                return lossPercent > 0 && int(random() % 100u) < lossPercent;
+            }
+
+            Clock::time_point due()
+            {
+                int ms = halfMs;
+                if (jitterMs > 0)
+                    ms += int(random() % uint32_t(2 * jitterMs + 1)) - jitterMs;
+                return Clock::now() + std::chrono::milliseconds(std::max(0, ms));
+            }
+        };
+
+        LinkSim &linkSim()
+        {
+            static LinkSim sim;
+            return sim;
         }
 
         void sendRaw(const sockaddr_in &to, const uint8_t *data, size_t size)
         {
-            ::sendto(state().socket, reinterpret_cast<const char *>(data), int(size), 0,
-                     reinterpret_cast<const sockaddr *>(&to), sizeof(to));
+            LinkSim &sim = linkSim();
+            if (!sim.enabled)
+            {
+                sendNow(to, data, size);
+                return;
+            }
+            std::lock_guard<std::mutex> lock(sim.mutex);
+            if (sim.drop())
+                return;
+            sim.outgoing.emplace(sim.due(), LinkSim::Packet{to, std::vector<uint8_t>(data, data + size)});
+            sim.wake.notify_one();
+        }
+
+        void sendTo(const sockaddr_in &to, const Writer &packet)
+        {
+            sendRaw(to, packet.bytes.data(), packet.bytes.size());
         }
 
         // Host: forward a client's packet to every other client.
@@ -295,6 +405,7 @@ namespace ps2netplay
                 frame.input[player] = inputs[i];
                 frame.have |= uint8_t(1u << player);
             }
+            g_netChanged.notify_all();
         }
 
         void reportDesync(int player, uint64_t tick, uint64_t theirs, uint64_t ours)
@@ -426,7 +537,11 @@ namespace ps2netplay
                 w.u32(uint32_t(s.card.size()));
                 sendTo(from, w);
                 if (s.started)
-                    sendTo(from, Writer(Start));
+                {
+                    Writer start(Start);
+                    start.u8(uint8_t(s.delay));
+                    sendTo(from, start);
+                }
                 return;
             }
             case Welcome:
@@ -453,9 +568,19 @@ namespace ps2netplay
                 return;
             }
             case Start:
-                if (s.role == Role::Client && s.players > 1)
+            {
+                const uint8_t delay = r.u8();
+                if (s.role == Role::Client && s.players > 1 && r.ok)
+                {
+                    if (!s.started)
+                    {
+                        s.delay = std::max<int>(1, delay);
+                        log("session starting with an input delay of " + std::to_string(s.delay) + " frames");
+                    }
                     s.started = true;
+                }
                 return;
+            }
             case Input:
             {
                 const int player = r.u8();
@@ -481,6 +606,33 @@ namespace ps2netplay
                 checkHash(player, tick, hash);
                 if (s.role == Role::Host)
                     relay(player, data, size);
+                return;
+            }
+            case Ping:
+            {
+                // {sent time us, player}: answered at once by whoever receives it.
+                const uint64_t sentUs = r.u64();
+                const uint8_t player = r.u8();
+                Writer w(Pong);
+                w.u64(sentUs);
+                w.u8(player);
+                sendTo(from, w);
+                return;
+            }
+            case Pong:
+            {
+                const uint64_t sentUs = r.u64();
+                const int player = r.u8();
+                if (!r.ok)
+                    return;
+                const uint64_t nowUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch())
+                                                    .count());
+                const uint64_t rtt = nowUs - sentUs;
+                if (s.role == Role::Host && player > 0 && player < kMaxPlayers && !s.started)
+                    s.probeSamples[player].push_back(rtt);
+                s.rttSumUs += rtt;
+                ++s.rttCount;
                 return;
             }
             case CardRequest:
@@ -542,7 +694,30 @@ namespace ps2netplay
                                                  reinterpret_cast<sockaddr *>(&from), &fromLength);
                 if (received <= 0)
                     break;
-                handlePacket(buffer, size_t(received), from);
+                LinkSim &sim = linkSim();
+                if (!sim.enabled)
+                {
+                    handlePacket(buffer, size_t(received), from);
+                    continue;
+                }
+                std::lock_guard<std::mutex> lock(sim.mutex);
+                if (!sim.drop())
+                    sim.incoming.emplace(sim.due(), LinkSim::Packet{from, std::vector<uint8_t>(buffer, buffer + received)});
+            }
+            LinkSim &sim = linkSim();
+            if (!sim.enabled)
+                return;
+            for (;;)
+            {
+                LinkSim::Packet packet;
+                {
+                    std::lock_guard<std::mutex> lock(sim.mutex);
+                    if (sim.incoming.empty() || sim.incoming.begin()->first > LinkSim::Clock::now())
+                        break;
+                    packet = std::move(sim.incoming.begin()->second);
+                    sim.incoming.erase(sim.incoming.begin());
+                }
+                handlePacket(packet.bytes.data(), packet.bytes.size(), packet.address);
             }
         }
 
@@ -575,32 +750,128 @@ namespace ps2netplay
             return true;
         }
 
+        void startNetworkThread()
+        {
+            std::thread([]
+                        {
+                            for (;;)
+                            {
+                                {
+                                    std::lock_guard<std::mutex> lock(g_net);
+                                    pump();
+                                }
+                                // Sleep until a packet arrives (1 ms at most, for the simulator's delayed packets).
+                                fd_set readable;
+                                FD_ZERO(&readable);
+                                FD_SET(state().socket, &readable);
+                                timeval timeout{0, 1000};
+                                ::select(int(state().socket) + 1, &readable, nullptr, nullptr, &timeout);
+                            }
+                        })
+                .detach();
+        }
+
+        uint64_t nowUs()
+        {
+            return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+        }
+
+        // Host: the input delay that covers the slowest path an input takes. A client's input reaches another
+        // client through the host, so it is the two largest one-way latencies, plus a frame of margin for the
+        // machines' frames not lining up.
+        int chooseDelay()
+        {
+            State &s = state();
+            std::vector<double> oneWayMs;
+            for (int p = 1; p < s.players; ++p)
+                oneWayMs.push_back(double(s.probeRttUs[p]) / 2000.0);
+            std::sort(oneWayMs.rbegin(), oneWayMs.rend());
+            double pathMs = oneWayMs.empty() ? 0.0 : oneWayMs[0];
+            if (oneWayMs.size() >= 2)
+                pathMs += oneWayMs[1];
+            constexpr double kFrameMs = 1000.0 / 59.94;
+            const int delay = int(std::ceil((pathMs + 4.0) / kFrameMs)) + 1;
+            return std::clamp(delay, 2, 30);
+        }
+
         void connectSession()
         {
             State &s = state();
             using clock = std::chrono::steady_clock;
             if (s.role == Role::Host)
             {
-                if (s.getCard)
-                    s.card = packCard(s.getCard());
-                useSessionCard();
+                {
+                    std::lock_guard<std::mutex> lock(g_net);
+                    if (s.getCard)
+                        s.card = packCard(s.getCard());
+                    useSessionCard();
+                }
                 char text[128];
                 std::snprintf(text, sizeof(text), "hosting a %d-player session; waiting for players (UDP port %u)",
                               s.players, unsigned(ntohs(s.hostAddress.sin_port)));
                 log(text);
                 for (;;)
                 {
-                    pump();
-                    bool all = true;
-                    for (int p = 1; p < s.players; ++p)
-                        all = all && s.joined[p];
-                    if (all)
-                        break;
+                    {
+                        std::lock_guard<std::mutex> lock(g_net);
+                        bool all = true;
+                        for (int p = 1; p < s.players; ++p)
+                            all = all && s.joined[p];
+                        if (all)
+                            break;
+                    }
                     std::this_thread::sleep_for(std::chrono::milliseconds(5));
                 }
-                s.started = true;
-                for (int i = 0; i < 5; ++i)
-                    broadcast(Writer(Start));
+
+                // Measure each client's round trip for half a second, then start everyone with a fitting delay.
+                {
+                    std::lock_guard<std::mutex> lock(g_net);
+                    for (auto &samples : s.probeSamples)
+                        samples.clear();
+                }
+                const auto probeEnd = clock::now() + std::chrono::milliseconds(500);
+                while (clock::now() < probeEnd)
+                {
+                    {
+                        std::lock_guard<std::mutex> lock(g_net);
+                        for (int p = 1; p < s.players; ++p)
+                        {
+                            Writer w(Ping);
+                            w.u64(nowUs());
+                            w.u8(uint8_t(p));
+                            sendTo(s.peer[p], w);
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(150)); // late replies
+                {
+                    std::lock_guard<std::mutex> lock(g_net);
+                    std::string pings;
+                    for (int p = 1; p < s.players; ++p)
+                    {
+                        // The 90th percentile, so jitter is covered, not just the typical round trip.
+                        auto &samples = s.probeSamples[p];
+                        std::sort(samples.begin(), samples.end());
+                        s.probeRttUs[p] = samples.empty() ? 200000u // no reply: assume a slow link
+                                                          : samples[std::min(samples.size() - 1, samples.size() * 9 / 10)];
+                        pings += " player " + std::to_string(p + 1) + ": " + std::to_string(s.probeRttUs[p] / 1000u) + " ms";
+                    }
+                    if (s.autoDelay)
+                        s.delay = chooseDelay();
+                    log("pings:" + pings + "; input delay " + std::to_string(s.delay) + " frames" +
+                        (s.autoDelay ? " (automatic)" : ""));
+                    s.started = true;
+                    s.rttSumUs = s.rttCount = 0;
+                    for (int i = 0; i < 5; ++i)
+                    {
+                        Writer start(Start);
+                        start.u8(uint8_t(s.delay));
+                        broadcast(start);
+                    }
+                }
                 log("all players joined; starting");
                 return;
             }
@@ -609,8 +880,11 @@ namespace ps2netplay
             auto nextHello = clock::now();
             auto nextRequest = clock::now();
             size_t requestedAt = SIZE_MAX;
-            while (!s.started || !s.cardDone)
+            for (;;)
             {
+                std::unique_lock<std::mutex> lock(g_net);
+                if (s.started && s.cardDone)
+                    break;
                 if (!s.cardKnown && clock::now() >= nextHello)
                 {
                     Writer w(Hello);
@@ -631,10 +905,14 @@ namespace ps2netplay
                         nextRequest = clock::now() + std::chrono::milliseconds(100);
                     }
                 }
-                pump();
+                lock.unlock();
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
-            useSessionCard();
+            {
+                std::lock_guard<std::mutex> lock(g_net);
+                s.rttSumUs = s.rttCount = 0;
+                useSessionCard();
+            }
             log("session started");
         }
 
@@ -677,7 +955,10 @@ namespace ps2netplay
                 {
                     // Players 1-4 sit in the multitap slots of pad port 1.
                     s.players = std::clamp(envInt("PS2X_NETPLAY_PLAYERS", 2), 2, kMaxPlayers);
-                    s.delay = std::clamp(envInt("PS2X_NETPLAY_DELAY", 3), 1, 30);
+                    // PS2X_NETPLAY_DELAY=<frames> fixes the input delay; unset or 0 = chosen from the measured pings.
+                    const int delay = envInt("PS2X_NETPLAY_DELAY", 0);
+                    s.autoDelay = delay <= 0;
+                    s.delay = s.autoDelay ? 3 : std::clamp(delay, 1, 30);
                     s.presentMask = uint8_t((1u << s.players) - 1u);
                     s.hostAddress.sin_port = htons(port);
                     if (!openSocket(port))
@@ -698,6 +979,7 @@ namespace ps2netplay
                 }
                 if (s.hashEvery == 0u)
                     s.hashEvery = kHashInterval;
+                startNetworkThread();
                 connectSession();
                 return;
             }
@@ -844,18 +1126,30 @@ namespace ps2netplay
         case Role::Host:
         case Role::Client:
         {
+            // Sample before taking the lock (raylib input polling).
+            const PadInput local = sampleLocal(runtime);
+            std::unique_lock<std::mutex> lock(g_net);
             // This machine's input for tick + delay.
             const uint64_t target = tick + uint64_t(s.delay);
             if (s.localHistory.size() <= target)
                 s.localHistory.resize(target + 1u);
-            s.localHistory[target] = sampleLocal(runtime);
+            s.localHistory[target] = local;
             Frame &own = s.frames[target];
             own.input[s.localPlayer] = s.localHistory[target];
             own.have |= uint8_t(1u << s.localPlayer);
-            pump();
             sendLocalInputs(target);
 
+            // Clients measure the round trip to the host once a second.
+            if (s.role == Role::Client && tick % 60u == 0u)
+            {
+                Writer w(Ping);
+                w.u64(nowUs());
+                w.u8(uint8_t(s.localPlayer));
+                sendTo(s.hostAddress, w);
+            }
+
             // Wait until every player's input for this tick is here (the first `delay` ticks are idle for all).
+            const auto waitStart = std::chrono::steady_clock::now();
             if (tick > uint64_t(s.delay))
             {
                 using clock = std::chrono::steady_clock;
@@ -867,7 +1161,6 @@ namespace ps2netplay
                     const uint8_t needed = uint8_t(s.presentMask & ~s.droppedMask);
                     if ((s.frames[tick].have & needed) == needed)
                         break;
-                    pump();
                     const auto now = clock::now();
                     if (now >= nextResend)
                     {
@@ -886,8 +1179,36 @@ namespace ps2netplay
                         log("lost contact with a player (mask " + std::to_string(missing) + "); their pad is idle from now on");
                         break;
                     }
-                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    g_netChanged.wait_for(lock, std::chrono::milliseconds(2));
                 }
+            }
+            const uint64_t waitedUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                   std::chrono::steady_clock::now() - waitStart)
+                                                   .count());
+            if (waitedUs > 1000u)
+            {
+                ++s.statStalls;
+                s.statWaitUs += waitedUs;
+                s.statMaxWaitUs = std::max(s.statMaxWaitUs, waitedUs);
+            }
+            if (tick % 600u == 0u)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (s.statStart != std::chrono::steady_clock::time_point{})
+                {
+                    const double seconds = std::chrono::duration<double>(now - s.statStart).count();
+                    char text[200];
+                    std::snprintf(text, sizeof(text),
+                                  "stats tick %llu: %.1f fps, %u of 600 frames waited for input (%.0f ms total, max %.1f ms), ping %.0f ms",
+                                  static_cast<unsigned long long>(tick), 600.0 / seconds, s.statStalls,
+                                  double(s.statWaitUs) / 1000.0, double(s.statMaxWaitUs) / 1000.0,
+                                  s.rttCount ? double(s.rttSumUs) / double(s.rttCount) / 1000.0 : 0.0);
+                    log(text);
+                }
+                s.statStart = now;
+                s.statStalls = 0;
+                s.statWaitUs = s.statMaxWaitUs = 0;
+                s.rttSumUs = s.rttCount = 0;
             }
             const Frame frame = s.frames[tick];
             for (int p = 0; p < kMaxPlayers; ++p)
@@ -927,6 +1248,7 @@ namespace ps2netplay
             }
             if (s.role == Role::Host || s.role == Role::Client)
             {
+                std::lock_guard<std::mutex> lock(g_net);
                 s.localHashes[tick] = hash;
                 while (s.localHashes.size() > 64u)
                     s.localHashes.erase(s.localHashes.begin());

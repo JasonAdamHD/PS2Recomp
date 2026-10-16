@@ -94,14 +94,21 @@ namespace
         return held;
     }
 
+    // Pseudo-buttons for the scripted left stick (not real PS2 pad bits; never reported as buttons).
+    constexpr uint32_t STICK_LEFT = 0x10000u;
+    constexpr uint32_t STICK_RIGHT = 0x20000u;
+    constexpr uint32_t STICK_UP = 0x40000u;
+    constexpr uint32_t STICK_DOWN = 0x80000u;
+
     // Test aid: PS2X_AUTOPRESS="cross@600,start@640" holds the named button for ~1.5 s at each listed
-    // number of seconds after launch, so automated runs can step through menus.
-    uint16_t scriptedButtons()
+    // number of seconds after launch, so automated runs can step through menus. "lleft", "lright", "lup" and
+    // "ldown" push the left stick fully that way instead.
+    uint32_t scriptedInputs()
     {
         struct ScriptedPress
         {
             double atSeconds = 0.0;
-            uint16_t bit = 0;
+            uint32_t bit = 0;
         };
         static const std::vector<ScriptedPress> presses = []
         {
@@ -109,10 +116,11 @@ namespace
             const char *script = std::getenv("PS2X_AUTOPRESS");
             if (!script)
                 return parsed;
-            const std::pair<const char *, uint16_t> names[] = {
+            const std::pair<const char *, uint32_t> names[] = {
                 {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE}, {"triangle", PAD_TRIANGLE},
                 {"start", PAD_START}, {"select", PAD_SELECT}, {"up", PAD_UP}, {"down", PAD_DOWN},
-                {"left", PAD_LEFT}, {"right", PAD_RIGHT}};
+                {"left", PAD_LEFT}, {"right", PAD_RIGHT}, {"lleft", STICK_LEFT}, {"lright", STICK_RIGHT},
+                {"lup", STICK_UP}, {"ldown", STICK_DOWN}};
             std::string text(script);
             size_t begin = 0;
             while (begin < text.size())
@@ -132,13 +140,13 @@ namespace
             return parsed;
         }();
         static const auto start = std::chrono::steady_clock::now();
-        uint16_t held = 0u;
+        uint32_t held = 0u;
         if (!presses.empty())
         {
             const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
             for (const ScriptedPress &press : presses)
                 if (now >= press.atSeconds && now < press.atSeconds + 1.5)
-                    held = static_cast<uint16_t>(held | press.bit);
+                    held |= press.bit;
         }
         return held;
     }
@@ -166,7 +174,8 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
     if (port != 0 || slot != 0)
         return true;
 
-    const uint16_t held = static_cast<uint16_t>(heldButtons() | scriptedButtons() |
+    const uint32_t scripted = scriptedInputs();
+    const uint16_t held = static_cast<uint16_t>(heldButtons() | (scripted & 0xFFFFu) |
                                                 g_latchedPresses.exchange(0u, std::memory_order_relaxed));
     const uint16_t btns = static_cast<uint16_t>(~held);
 
@@ -182,6 +191,15 @@ bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
         data[4] = static_cast<uint8_t>(128 + rx * 127);
         data[5] = static_cast<uint8_t>(128 + ry * 127);
     }
+    // The scripted stick wins over a connected gamepad so automated runs behave the same on any machine.
+    if (scripted & STICK_LEFT)
+        data[6] = 0x00;
+    if (scripted & STICK_RIGHT)
+        data[6] = 0xFF;
+    if (scripted & STICK_UP)
+        data[7] = 0x00;
+    if (scripted & STICK_DOWN)
+        data[7] = 0xFF;
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

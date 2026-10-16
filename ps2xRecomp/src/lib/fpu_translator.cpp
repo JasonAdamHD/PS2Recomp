@@ -58,7 +58,8 @@ namespace ps2recomp
                                    "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
                                    ft, fd, fs, fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // SQRT.S fd, ft: the source is ft (the fs field is unused, normally 0). The PS2 FPU takes the root of |ft|.
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(fabsf(ctx->f[{}]));", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:

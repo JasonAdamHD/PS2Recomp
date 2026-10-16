@@ -154,6 +154,22 @@ void register_vu0_flag_tests()
                      "RSQRT.S fd = fs / sqrt(|ft|)");
         });
 
+        tc.Run("SQRT.S takes the root of ft", [](TestCase &t)
+        {
+            // sqrt.s $f1, $f1 encodes as 0x46010044: ft = 1, fs = 0, fd = 1.
+            ps2recomp::Instruction inst{};
+            inst.opcode = ps2recomp::OPCODE_COP1;
+            inst.rs = ps2recomp::COP1_S;
+            inst.function = ps2recomp::COP1_S_SQRT;
+            inst.rd = 0; // fs (unused)
+            inst.rt = 1; // ft
+            inst.sa = 1; // fd
+            ps2recomp::CodeGenerator gen({}, {});
+            const std::string code = gen.translateInstruction(inst);
+            t.IsTrue(code.find("ctx->f[1] = FPU_SQRT_S(fabsf(ctx->f[1]))") != std::string::npos, "SQRT.S fd = sqrt(|ft|)");
+            t.IsTrue(code.find("ctx->f[0]") == std::string::npos, "SQRT.S must not read fs");
+        });
+
         tc.Run("BC2 tests VU0 busy, not the status Z flag", [](TestCase &t)
         {
             // bc2t +1; nop

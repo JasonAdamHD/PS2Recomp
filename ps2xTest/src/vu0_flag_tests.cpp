@@ -170,6 +170,66 @@ void register_vu0_flag_tests()
             t.IsTrue(code.find("ctx->f[0]") == std::string::npos, "SQRT.S must not read fs");
         });
 
+        tc.Run("DIV.S and MOVZ codegen", [](TestCase &t)
+        {
+            ps2recomp::CodeGenerator gen({}, {});
+            ps2recomp::Instruction div{};
+            div.opcode = ps2recomp::OPCODE_COP1;
+            div.rs = ps2recomp::COP1_S;
+            div.function = ps2recomp::COP1_S_DIV;
+            div.rd = 1; // fs
+            div.rt = 2; // ft
+            div.sa = 3; // fd
+            t.IsTrue(gen.translateInstruction(div).find("ctx->f[3] = Ps2FpuDivS(ctx, ctx->f[1], ctx->f[2])") != std::string::npos,
+                     "DIV.S fd = fs / ft via the EE helper");
+
+            ps2recomp::Instruction movz{};
+            movz.opcode = ps2recomp::OPCODE_SPECIAL;
+            movz.function = ps2recomp::SPECIAL_MOVZ;
+            movz.rs = 4;
+            movz.rt = 5;
+            movz.rd = 6;
+            const std::string code = gen.translateInstruction(movz);
+            t.IsTrue(code.find("SET_GPR_U64(ctx, 6, GPR_U64(ctx, 4))") != std::string::npos, "MOVZ moves the low 64 bits");
+            t.IsTrue(code.find("SET_GPR_VEC") == std::string::npos, "MOVZ must not touch the upper 64 bits");
+        });
+
+        tc.Run("runtime: PINTH and PINTEH halfword interleave", [](TestCase &t)
+        {
+            const __m128i rs = _mm_setr_epi16(0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17);
+            const __m128i rt = _mm_setr_epi16(0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27);
+            alignas(16) uint16_t out[8];
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PINTH(rs, rt));
+            const uint16_t pinth[8] = {0x20, 0x14, 0x21, 0x15, 0x22, 0x16, 0x23, 0x17};
+            t.IsTrue(std::memcmp(out, pinth, sizeof(out)) == 0, "PINTH = {rt.h0, rs.h4, rt.h1, rs.h5, ...}");
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PINTEH(rs, rt));
+            const uint16_t pinteh[8] = {0x20, 0x10, 0x22, 0x12, 0x24, 0x14, 0x26, 0x16};
+            t.IsTrue(std::memcmp(out, pinteh, sizeof(out)) == 0, "PINTEH = {rt.h0, rs.h0, rt.h2, rs.h2, ...}");
+        });
+
+        tc.Run("VFTOI saturates positive overflow", [](TestCase &t)
+        {
+            // vftoi0.xyzw vf1, vf2 (special2 index 0x14)
+            const std::string code = generate({cop2Special2(kDestXYZW, 1, 2, 0x14), 0u});
+            t.IsTrue(code.find("_mm_cmpge_ps(src, _mm_set1_ps(2147483648.0f))") != std::string::npos, "+overflow flips 0x80000000 to 0x7FFFFFFF");
+        });
+
+        tc.Run("runtime: CVT.W.S truncates and saturates, DIV.S by zero", [](TestCase &t)
+        {
+            t.Equals(Ps2FpuCvtWS(2.7f), 2, "truncates toward zero");
+            t.Equals(Ps2FpuCvtWS(-2.7f), -2, "truncates negative toward zero");
+            t.Equals(Ps2FpuCvtWS(3.0e9f), INT32_MAX, "saturates high");
+            t.Equals(Ps2FpuCvtWS(-3.0e9f), INT32_MIN, "saturates low");
+
+            R5900Context ctx{};
+            t.Equals(Ps2FpuDivS(&ctx, 1.0f, -0.0f), -kFltMax, "x/-0 -> -max");
+            t.Equals(ctx.fcr31 & 0x10000u, 0x10000u, "x/0 raises D");
+            ctx.fcr31 = 0;
+            t.Equals(Ps2FpuDivS(&ctx, -0.0f, 0.0f), -kFltMax, "0/0 sign from fs^ft");
+            t.Equals(ctx.fcr31 & 0x20000u, 0x20000u, "0/0 raises I");
+            t.Equals(Ps2FpuDivS(&ctx, 6.0f, 3.0f), 2.0f, "normal divide");
+        });
+
         tc.Run("BC2 tests VU0 busy, not the status Z flag", [](TestCase &t)
         {
             // bc2t +1; nop

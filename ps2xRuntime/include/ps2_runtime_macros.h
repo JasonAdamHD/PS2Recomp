@@ -610,8 +610,10 @@ inline __m128i ps2_ppacb(__m128i rs, __m128i rt)
 #define PS2_PPACB(a, b) ps2_ppacb((__m128i)(a), (__m128i)(b))
 
 // Packed Interleave (PINT)
-#define PS2_PINTH(a, b) _mm_unpacklo_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
-#define PS2_PINTEH(a, b) _mm_unpackhi_epi16(_mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)))
+// PINTH rd, rs, rt: interleave rt's lower halfwords with rs's upper halfwords {rt.h0, rs.h4, rt.h1, rs.h5, ...}.
+#define PS2_PINTH(a, b) _mm_unpacklo_epi16((__m128i)(b), _mm_unpackhi_epi64((__m128i)(a), (__m128i)(a)))
+// PINTEH rd, rs, rt: the even halfwords of each, {rt.h0, rs.h0, rt.h2, rs.h2, ...}.
+#define PS2_PINTEH(a, b) _mm_or_si128(_mm_and_si128((__m128i)(b), _mm_set1_epi32(0x0000FFFF)), _mm_slli_epi32((__m128i)(a), 16))
 
 // Packed Multiply-Add (PMADD)
 #define PS2_PMADDW(a, b) _mm_add_epi32(_mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(1, 0, 3, 2)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(1, 0, 3, 2))), _mm_mullo_epi32(_mm_shuffle_epi32((__m128i)(a), _MM_SHUFFLE(3, 2, 1, 0)), _mm_shuffle_epi32((__m128i)(b), _MM_SHUFFLE(3, 2, 1, 0))))
@@ -696,7 +698,32 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// CVT.W.S on the EE always truncates toward zero and saturates out-of-range values (incl. NaN/Inf bit patterns).
+static inline int32_t Ps2FpuCvtWS(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) <= 0x4E800000u)
+        return static_cast<int32_t>(value);
+    return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+}
+
+// DIV.S on the EE: a zero (or denormal) divisor yields +/-FLT_MAX with the XOR of the operand signs, setting I (0/0) or D.
+static inline float Ps2FpuDivS(R5900Context *ctx, float dividend, float divisor)
+{
+    uint32_t a, b;
+    std::memcpy(&a, &dividend, sizeof(a));
+    std::memcpy(&b, &divisor, sizeof(b));
+    if ((b & 0x7F800000u) != 0u)
+        return dividend / divisor;
+    ctx->fcr31 |= ((a & 0x7F800000u) == 0u) ? (0x20000u | 0x40u) : (0x10000u | 0x20u);
+    const uint32_t bitsOut = ((a ^ b) & 0x80000000u) | 0x7F7FFFFFu;
+    float out;
+    std::memcpy(&out, &bitsOut, sizeof(out));
+    return out;
+}
+
+#define FPU_CVT_W_S(a) Ps2FpuCvtWS((float)(a))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))

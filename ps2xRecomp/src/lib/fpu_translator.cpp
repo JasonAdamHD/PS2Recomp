@@ -53,10 +53,7 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                return fmt::format("ctx->f[{}] = Ps2FpuDivS(ctx, ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_SQRT:
                 // SQRT.S fd, ft: the source is ft (the fs field is unused, normally 0). The PS2 FPU takes the root of |ft|.
                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(fabsf(ctx->f[{}]));", fd, ft);

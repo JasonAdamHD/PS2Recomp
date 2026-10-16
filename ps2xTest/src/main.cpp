@@ -1,6 +1,7 @@
 #include "MiniTest.h"
 #include <cstdlib>
 #include <iostream>
+#include <string>
 
 void register_code_generator_tests();
 void register_r5900_decoder_tests();
@@ -24,6 +25,15 @@ void reset_ps2_test_function_table();
 int main()
 {
     MiniTest::BeforeEach(reset_ps2_test_function_table);
+
+    // PS2X_TEST_ONLY=vu0 runs just the VU0/FPU/MMI semantics tests.
+    if (const char *only = std::getenv("PS2X_TEST_ONLY"); only && std::string(only) == "vu0")
+    {
+        register_vu0_flag_tests();
+        int res = MiniTest::Run();
+        std::cout.flush();
+        std::_Exit(res);
+    }
 
     register_code_generator_tests();
     register_r5900_decoder_tests();

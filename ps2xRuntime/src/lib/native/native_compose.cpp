@@ -226,7 +226,14 @@ namespace ps2native
         if (!frame && m == Mode::Overlay)
             return scanout;
 
-        const unsigned width = scanout.image->get_width(), height = scanout.image->get_height();
+        // The frame is rendered at a multiple of the scanout size (and 4/3 wider for 16:9); vertices stay in GS
+        // window units, so only the render target, scissors and copies to or from the scanout are scaled.
+        const unsigned baseWidth = scanout.image->get_width(), baseHeight = scanout.image->get_height();
+        const bool wide = widescreen();
+        const float scale = resolutionScale();
+        const unsigned width = unsigned(float(baseWidth) * scale * (wide ? 4.0f / 3.0f : 1.0f) + 0.5f);
+        const unsigned height = unsigned(float(baseHeight) * scale + 0.5f);
+        const float scaleX = float(width) / float(baseWidth), scaleY = float(height) / float(baseHeight);
         auto colorInfo = Vulkan::ImageCreateInfo::render_target(width, height, VK_FORMAT_R8G8B8A8_UNORM);
         colorInfo.initial_layout = VK_IMAGE_LAYOUT_UNDEFINED;
         auto depthInfo = Vulkan::ImageCreateInfo::render_target(width, height, VK_FORMAT_D32_SFLOAT);
@@ -256,7 +263,8 @@ namespace ps2native
         {
             cmd->image_barrier(*color, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-            cmd->copy_image(*color, *scanout.image);
+            cmd->blit_image(*color, *scanout.image, {0, 0, 0}, {int(width), int(height), 1}, {0, 0, 0},
+                            {int(baseWidth), int(baseHeight), 1}, 0, 0);
             cmd->image_barrier(*color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -410,18 +418,36 @@ namespace ps2native
                 pc.screen[3] = batch.screenOffset[1];
                 pc.target[0] = float(xyoffset & 0xffffu);
                 pc.target[1] = float((xyoffset >> 32) & 0xffffu);
-                pc.target[2] = 1.0f / float(width);
-                pc.target[3] = 1.0f / float(height);
+                pc.target[2] = 1.0f / float(baseWidth);
+                pc.target[3] = 1.0f / float(baseHeight);
                 pc.misc[0] = batch.screenSpace ? 1.0f / depthRange(batch.regs.zbuf[ctx])
                                                : batch.depthScale / depthRange(batch.regs.zbuf[ctx]);
                 // GS scissor (window pixels of the frame buffer).
                 const uint64_t sc = batch.regs.scissor[ctx];
                 const int sx0 = int(sc & 0x7ffu), sx1 = int((sc >> 16) & 0x7ffu), sy0 = int((sc >> 32) & 0x7ffu), sy1 = int((sc >> 48) & 0x7ffu);
+                // Widescreen narrows screen-space draws about the centre, so their scissor narrows with them.
+                // Draws covering the full width (backgrounds, fades, flashes) stay stretched across the screen.
+                float squeeze = 1.0f;
+                if (wide && batch.screenSpace)
+                {
+                    const float originX = float(xyoffset & 0xffffu);
+                    float minX = 1e9f, maxX = -1e9f;
+                    for (const Vertex &v : batch.vertices)
+                    {
+                        minX = std::min(minX, v.pos[0]);
+                        maxX = std::max(maxX, v.pos[0]);
+                    }
+                    const bool fullWidth = (minX - originX) / 16.0f <= 8.0f && (maxX - originX) / 16.0f >= float(baseWidth) - 8.0f;
+                    squeeze = fullWidth ? 1.0f : 0.75f;
+                }
+                const float half = float(baseWidth) * 0.5f;
+                const auto mapX = [&](float x) { return ((x - half) * squeeze + half) * scaleX; };
                 VkRect2D scissor{};
-                scissor.offset.x = std::min(sx0, int(width));
-                scissor.offset.y = std::min(sy0, int(height));
-                scissor.extent.width = uint32_t(std::max(0, std::min(sx1 + 1, int(width)) - scissor.offset.x));
-                scissor.extent.height = uint32_t(std::max(0, std::min(sy1 + 1, int(height)) - scissor.offset.y));
+                scissor.offset.x = std::clamp(int(mapX(float(sx0))), 0, int(width));
+                scissor.offset.y = std::clamp(int(float(sy0) * scaleY), 0, int(height));
+                scissor.extent.width = uint32_t(std::max(0, std::min(int(mapX(float(sx1 + 1)) + 0.5f), int(width)) - scissor.offset.x));
+                scissor.extent.height = uint32_t(std::max(0, std::min(int(float(sy1 + 1) * scaleY + 0.5f), int(height)) - scissor.offset.y));
+                pc.misc[3] = squeeze;
                 cmd->set_scissor(scissor);
                 const uint32_t tint = debugTint(batch.debugTag);
                 std::memcpy(&pc.misc[1], &tint, sizeof(tint));
@@ -478,7 +504,9 @@ namespace ps2native
                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
             const VkImageSubresourceLayers layers{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            cmd->copy_image(*color, *scanout.image, {0, 0, 0}, {0, 0, 0}, {width / 2u, height, 1u}, layers, layers);
+            (void)layers;
+            cmd->blit_image(*color, *scanout.image, {0, 0, 0}, {int(width / 2u), int(height), 1}, {0, 0, 0},
+                            {int(baseWidth / 2u), int(baseHeight), 1}, 0, 0);
             cmd->image_barrier(*color, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);

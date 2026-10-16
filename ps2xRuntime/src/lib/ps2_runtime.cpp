@@ -1,3 +1,4 @@
+#include "runtime/native/native_renderer.h"
 #include "ps2_runtime.h"
 #include "ps2_log.h"
 #include "ps2_stubs.h"
@@ -592,7 +593,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        Image blank = GenImageColor(tex.width, tex.height, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
@@ -628,13 +629,22 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
+    // Frames above the PS2 resolution (native renderer scaling) grow the texture to fit.
+    if (width > static_cast<uint32_t>(tex.width) || height > static_cast<uint32_t>(tex.height))
+    {
+        Image blank = GenImageColor(std::max<int>(tex.width, int(width)), std::max<int>(tex.height, int(height)), BLANK);
+        UnloadTexture(tex);
+        tex = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+    }
+    s_uploadBuffer.assign(static_cast<size_t>(tex.width) * static_cast<size_t>(tex.height) * 4u, 0u);
     if (!s_scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
+        const uint32_t copyWidth = std::min<uint32_t>(width, static_cast<uint32_t>(tex.width));
+        const uint32_t copyHeight = std::min<uint32_t>(height, static_cast<uint32_t>(tex.height));
         const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(tex.width) * 4u;
         const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
         for (uint32_t y = 0; y < copyHeight; ++y)
         {
@@ -925,7 +935,14 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        {
+            // The window starts at the native renderer's output size (resolution scale and aspect), up to 2x.
+            const float windowScale = std::min(ps2native::resolutionScale(), 2.0f);
+            const int windowHeight = int(float(HOST_WINDOW_HEIGHT) * windowScale);
+            const int windowWidth = ps2native::enabled() ? int(float(windowHeight) * ps2native::presentAspect())
+                                                         : int(float(HOST_WINDOW_WIDTH) * windowScale);
+            InitWindow(windowWidth, windowHeight, title);
+        }
         s_windowTitle = title ? title : "";
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -2952,6 +2969,7 @@ void PS2Runtime::run()
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
+    SetTextureFilter(frameTex, TEXTURE_FILTER_BILINEAR); // smooth scaling to the window (and downsampling)
     UnloadImage(blank);
 
     std::atomic<bool> gameThreadFinished{false};
@@ -3097,7 +3115,7 @@ void PS2Runtime::run()
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
         Texture2D presentationTexture = frameTex;
-        float aspectRatio = 0.0f;
+        float aspectRatio = m_gs.latchedPresentationAspectRatio();
         auto gpuFrame = m_gs.getLatchedGpuFrame(presentWidth, presentHeight, aspectRatio);
         if (gpuFrame)
             presentationTexture = Texture2D{static_cast<unsigned int>(gpuFrame->AcquireTexture()), int(presentWidth), int(presentHeight), 1, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};

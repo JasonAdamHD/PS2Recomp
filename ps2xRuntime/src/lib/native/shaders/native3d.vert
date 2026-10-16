@@ -9,7 +9,8 @@ layout(push_constant, std430) uniform Constants
     mat4 objectToClip;
     vec4 screen; // xy = scale, zw = offset (GS 12.4 window units)
     vec4 target; // xy = XYOFFSET (12.4), zw = 1 / target size in pixels
-    vec4 misc;   // x = depth numerator (normalised; screen-space: 1 / Z range), y = packed debug tint, z = tint mix
+    vec4 misc;   // x = depth numerator (normalised; screen-space: 1 / Z range), y = packed debug tint, z = tint mix,
+                 // w = horizontal squeeze about the centre (widescreen 2D)
     vec4 shade;  // x = AREF, y = state bits (see native3d.frag; bit 11 = screen-space vertices)
 } pc;
 
@@ -22,7 +23,9 @@ void main()
     {
         // Replayed GS primitive: position is already in GS window coordinates (12.4) with integer Z.
         vec2 pixel = (aPos.xy - pc.target.xy) * (1.0 / 16.0);
-        gl_Position = vec4(pixel * pc.target.zw * 2.0 - 1.0, aPos.z * pc.misc.x, 1.0);
+        vec2 unit = pixel * pc.target.zw;
+        unit.x = (unit.x - 0.5) * pc.misc.w + 0.5;
+        gl_Position = vec4(unit * 2.0 - 1.0, aPos.z * pc.misc.x, 1.0);
         vColor = aColor;
         vSTQ = aSTQ;
         return;

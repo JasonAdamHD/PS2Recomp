@@ -308,6 +308,7 @@ struct PresentationFrame
     std::shared_ptr<GSGpuFrame> gpu;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t stride = 0; // pixels per row of `pixels`; 0 = the legacy 640-pixel rows
     uint32_t displayFbp = 0;
     uint32_t sourceFbp = 0;
     bool usedPreferred = false;

@@ -1,3 +1,4 @@
+#include "runtime/native/native_renderer.h"
 #include "gs_gl_interop.h"
 #include "context.hpp"
 #define GLFW_INCLUDE_NONE
@@ -413,20 +414,16 @@ PresentationFrame GSGLInterop::present(const ParallelGS::ScanoutResult &scanout)
         fence->wait();
         const auto *pixels = static_cast<const uint8_t *>(d.map_host_buffer(*readback, Vulkan::MEMORY_ACCESS_READ_BIT));
 
-        // The frontend expects rows of 640 pixels; the PS2 framebuffer alpha is not display opacity.
-        constexpr uint32_t kHostFrameWidth = 640u, kHostFrameHeight = 512u;
-        const uint32_t outWidth = std::min(width, kHostFrameWidth), outHeight = std::min(height, kHostFrameHeight);
+        // Full-size frame (the native renderer may render above the PS2 resolution); the PS2 framebuffer alpha is
+        // not display opacity.
         PresentationFrame frame;
-        frame.pixels.assign(size_t(kHostFrameWidth) * outHeight * 4u, 0u);
-        for (uint32_t y = 0; y < outHeight; ++y)
-        {
-            uint8_t *dst = frame.pixels.data() + size_t(y) * kHostFrameWidth * 4u;
-            std::memcpy(dst, pixels + size_t(y) * width * 4u, size_t(outWidth) * 4u);
-            for (uint32_t x = 0; x < outWidth; ++x)
-                dst[x * 4u + 3u] = 0xFFu;
-        }
-        frame.width = outWidth;
-        frame.height = outHeight;
+        frame.pixels.assign(pixels, pixels + size_t(width) * height * 4u);
+        for (size_t i = 3; i < frame.pixels.size(); i += 4u)
+            frame.pixels[i] = 0xFFu;
+        frame.width = width;
+        frame.height = height;
+        frame.stride = width;
+        frame.aspectRatio = ps2native::presentAspect();
         return frame;
     }
     auto &slot = m_impl->slots[m_impl->next++ % 2];
@@ -442,8 +439,8 @@ PresentationFrame GSGLInterop::present(const ParallelGS::ScanoutResult &scanout)
     frame.gpu = slot;
     frame.width = width;
     frame.height = height;
-    frame.aspectRatio = 4.0f / 3.0f;
-    if (scanout.mode_width && scanout.mode_height && scanout.internal_height)
+    frame.aspectRatio = ps2native::presentAspect();
+    if (!ps2native::enabled() && scanout.mode_width && scanout.mode_height && scanout.internal_height)
         frame.aspectRatio *= (float(scanout.internal_width) / scanout.mode_width) /
                              (float(scanout.internal_height) / scanout.mode_height);
     return frame;

@@ -55,6 +55,27 @@ namespace ps2native
         constexpr size_t kMaxOpenBatches = 65536;
     }
 
+    float resolutionScale()
+    {
+        static const float value = []
+        {
+            const char *env = std::getenv("PS2X_RES_SCALE");
+            const float scale = env ? static_cast<float>(std::atof(env)) : 1.0f;
+            return scale >= 1.0f && scale <= 8.0f ? scale : 1.0f;
+        }();
+        return value;
+    }
+
+    bool widescreen()
+    {
+        static const bool value = []
+        {
+            const char *env = std::getenv("PS2X_WIDESCREEN");
+            return env && std::atoi(env) != 0;
+        }();
+        return value;
+    }
+
     Mode mode()
     {
         static const Mode value = []

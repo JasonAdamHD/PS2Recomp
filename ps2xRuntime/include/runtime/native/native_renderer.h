@@ -31,6 +31,14 @@ namespace ps2native
     // Handled VU1 batches skip the interpreter.
     inline bool replacesVu1() { return mode() == Mode::Replace || mode() == Mode::Full; }
 
+    // PS2X_RES_SCALE=<1..8>: the native frame renders at this multiple of the PS2 resolution (default 1).
+    float resolutionScale();
+    // PS2X_WIDESCREEN=1: 16:9 output. The game is patched to a wider horizontal field of view (overrides), the
+    // frame is rendered wider and 2D screen-space draws (HUD, menus) are narrowed back to their 4:3 proportions.
+    bool widescreen();
+    // Display aspect ratio of the presented frame.
+    inline float presentAspect() { return widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f; }
+
     struct Vertex
     {
         float pos[3];  // object space, before the batch matrix (screen-space batches: GS window x, y in 12.4, Z)

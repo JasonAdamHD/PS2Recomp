@@ -620,8 +620,8 @@ void GS::latchHostPresentationFrame()
     }
 
     const bool hasFrame = static_cast<bool>(frame);
-    uint32_t litPixels = 0u;
-    for (size_t i = 0; i + 3 < frame.pixels.size(); i += 4)
+    uint32_t litPixels = 0u; // only "any lit pixel" matters
+    for (size_t i = 0; i + 3 < frame.pixels.size() && litPixels == 0u; i += 4)
         if ((frame.pixels[i] | frame.pixels[i + 1] | frame.pixels[i + 2]) != 0u)
             ++litPixels;
     const uint32_t displayFbp = frame.displayFbp;
@@ -666,6 +666,7 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationFrame = std::move(frame.pixels);
         m_hostPresentationGpuFrame = std::move(frame.gpu);
         m_hostPresentationAspectRatio = frame.aspectRatio;
+        m_hostPresentationStride = frame.stride != 0u ? frame.stride : kHostFrameWidth;
         m_hostPresentationWidth = width;
         m_hostPresentationHeight = height;
         m_hostPresentationDisplayFbp = displayFbp;
@@ -751,7 +752,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.resize(packedRowBytes * static_cast<size_t>(outHeight));
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = static_cast<size_t>(m_hostPresentationStride) * 4u;
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;
@@ -781,6 +782,12 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 bool ps2ProfileEnabled();
 extern std::atomic<uint64_t> g_ps2ProfileNanos[8];
+
+float GS::latchedPresentationAspectRatio() const
+{
+    std::lock_guard<std::mutex> lock(m_presentationMutex);
+    return m_hasHostPresentationFrame ? m_hostPresentationAspectRatio : 0.0f;
+}
 
 std::shared_ptr<GSGpuFrame> GS::getLatchedGpuFrame(uint32_t &width, uint32_t &height, float &aspectRatio) const
 {

@@ -416,6 +416,10 @@ namespace ps2x::iop::detail
                 cpu.yielded = true;
                 setV0(0);
             }
+            else
+            {
+                setV0(-100); // KE_ILLEGAL_CONTEXT: a call made outside a thread cannot block
+            }
             return true;
         }
         case 11:

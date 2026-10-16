@@ -1,7 +1,11 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -324,5 +328,141 @@ void PS2AudioBackend::stopAll()
         UnloadSound(t.snd);
     }
     m_impl->activeSounds.clear();
+#endif
+}
+
+namespace
+{
+    // Ring buffer between the IOP thread (producer) and the host audio callback (consumer).
+    struct SpuStream
+    {
+        static constexpr size_t kCapacityFrames = 48000u; // 1 s
+        static constexpr size_t kTargetFrames = 4800u;    // 100 ms of latency
+        static constexpr size_t kMaxFrames = 14400u;      // beyond 300 ms, drop the backlog to the target
+
+        std::mutex mutex;
+        std::vector<int16_t> ring = std::vector<int16_t>(kCapacityFrames * 2u);
+        size_t readFrame = 0;
+        size_t frames = 0;
+        bool primed = false;
+        bool started = false;
+
+        void push(const int16_t *data, size_t count)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (frames == kCapacityFrames)
+                {
+                    readFrame = (readFrame + 1u) % kCapacityFrames;
+                    --frames;
+                }
+                const size_t write = (readFrame + frames) % kCapacityFrames;
+                ring[write * 2u] = data[i * 2u];
+                ring[write * 2u + 1u] = data[i * 2u + 1u];
+                ++frames;
+            }
+            if (frames > kMaxFrames)
+            {
+                const size_t drop = frames - kTargetFrames;
+                readFrame = (readFrame + drop) % kCapacityFrames;
+                frames -= drop;
+            }
+            if (frames >= kTargetFrames)
+                primed = true;
+        }
+
+        void pull(int16_t *out, size_t count)
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            size_t i = 0;
+            if (primed)
+            {
+                for (; i < count && frames > 0u; ++i)
+                {
+                    out[i * 2u] = ring[readFrame * 2u];
+                    out[i * 2u + 1u] = ring[readFrame * 2u + 1u];
+                    readFrame = (readFrame + 1u) % kCapacityFrames;
+                    --frames;
+                }
+                if (frames == 0u)
+                    primed = false; // underrun: wait for the buffer to refill before playing again
+            }
+            std::fill(out + i * 2u, out + count * 2u, int16_t{0});
+        }
+    };
+
+    SpuStream &spuStream()
+    {
+        static SpuStream stream;
+        return stream;
+    }
+
+#if !defined(PLATFORM_VITA)
+    void spuStreamCallback(void *buffer, unsigned int frames)
+    {
+        spuStream().pull(static_cast<int16_t *>(buffer), frames);
+    }
+#endif
+}
+
+void PS2AudioBackend::pushSpuOutput(const int16_t *interleaved, size_t frames)
+{
+#if defined(PLATFORM_VITA)
+    (void)interleaved;
+    (void)frames;
+#else
+    if (!m_audioReady || !interleaved || frames == 0u)
+        return;
+    SpuStream &stream = spuStream();
+    if (!stream.started)
+    {
+        stream.started = true;
+        SetAudioStreamBufferSizeDefault(1024);
+        AudioStream audio = LoadAudioStream(48000u, 16u, 2u);
+        SetAudioStreamCallback(audio, &spuStreamCallback);
+        PlayAudioStream(audio);
+    }
+    stream.push(interleaved, frames);
+
+    // PS2X_SPU_WAV=<path> records the first minute of SPU2 output as a 48 kHz stereo WAV.
+    static FILE *wav = nullptr;
+    static uint32_t wavFrames = 0;
+    static bool wavChecked = false;
+    if (!wavChecked)
+    {
+        wavChecked = true;
+        if (const char *path = std::getenv("PS2X_SPU_WAV"))
+            wav = std::fopen(path, "wb");
+        if (wav)
+        {
+            const std::vector<uint8_t> header = buildWavFromPcm(nullptr, 0u, 48000u);
+            std::fwrite(header.data(), 1u, header.size(), wav);
+        }
+    }
+    if (wav && wavFrames < 48000u * 60u)
+    {
+        std::fwrite(interleaved, sizeof(int16_t) * 2u, frames, wav);
+        wavFrames += static_cast<uint32_t>(frames);
+        if (wavFrames >= 48000u * 60u)
+        {
+            // Patch the header for stereo and the final data size.
+            const uint32_t dataBytes = wavFrames * 4u;
+            const uint32_t riffBytes = 36u + dataBytes;
+            const uint16_t channels = 2u, blockAlign = 4u;
+            const uint32_t byteRate = 48000u * 4u;
+            std::fseek(wav, 4, SEEK_SET);
+            std::fwrite(&riffBytes, 4u, 1u, wav);
+            std::fseek(wav, 22, SEEK_SET);
+            std::fwrite(&channels, 2u, 1u, wav);
+            std::fseek(wav, 28, SEEK_SET);
+            std::fwrite(&byteRate, 4u, 1u, wav);
+            std::fwrite(&blockAlign, 2u, 1u, wav);
+            std::fseek(wav, 40, SEEK_SET);
+            std::fwrite(&dataBytes, 4u, 1u, wav);
+            std::fclose(wav);
+            wav = nullptr;
+        }
+    }
 #endif
 }

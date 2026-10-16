@@ -10,6 +10,7 @@ constexpr uint64_t kIopClockHz = 36'864'000ull;
 constexpr uint64_t kVblankPeriodCycles = (kIopClockHz * 1001ull + 30'000ull) / 60'000ull;
 constexpr uint64_t kVblankEndPhaseCycles = kVblankPeriodCycles / 16ull;
 constexpr uint32_t kDefaultSlice = 256u;
+constexpr int kSpu2Irq = 9; // IOP interrupt line of the SPU2
 constexpr uint32_t kMaxCallInstructions = 2'000'000u;
 constexpr uint32_t kModuleLoadBase = 0x00010000u;
 constexpr uint32_t kStackGuardBytes = 64u;

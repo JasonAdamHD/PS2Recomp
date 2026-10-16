@@ -1,6 +1,7 @@
 #ifndef PS2_AUDIO_H
 #define PS2_AUDIO_H
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,9 @@ public:
     void stop(uint32_t voiceId);
     void stopAll();
     void setAudioReady(bool ready) { m_audioReady = ready; }
+
+    // 48 kHz interleaved stereo from the emulated SPU2, played through a host audio stream.
+    void pushSpuOutput(const int16_t *interleaved, size_t frames);
 
 private:
     struct DecodedSample

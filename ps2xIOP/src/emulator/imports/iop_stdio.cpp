@@ -3,6 +3,7 @@
 #include "../core/iop_cpu.h"
 #include "../core/iop_memory.h"
 #include "ps2x/iop/iop_host.h"
+#include "iop_format.h"
 
 #include <string>
 
@@ -27,11 +28,16 @@ namespace ps2x::iop::detail
             m_host.log(LogLevel::Info, std::string(prefix) + text);
             setV0(static_cast<uint32_t>(text.size()) + resultBias);
         };
+        const auto logFormatted = [&](std::string_view prefix, const std::string &text)
+        {
+            m_host.log(LogLevel::Info, std::string(prefix) + text);
+            setV0(static_cast<uint32_t>(text.size()));
+        };
 
         switch (ordinal)
         {
         case 4: // printf
-            logString("[IOP printf] ", a0);
+            logFormatted("[IOP printf] ", formatGuestString(m_memory, m_memory.readString(a0, 2048u), IopVarargs{m_memory, cpu.gpr, 5}));
             return true;
         case 5: // getchar
         case 10:
@@ -49,7 +55,7 @@ namespace ps2x::iop::detail
             setV0(0u);
             return true;
         case 9: // fdprintf
-            logString("[IOP fdprintf] ", a1);
+            logFormatted("[IOP fdprintf] ", formatGuestString(m_memory, m_memory.readString(a1, 2048u), IopVarargs{m_memory, cpu.gpr, 6}));
             return true;
         case 11:
             setV0(a0 & 0xFFu);
@@ -58,7 +64,7 @@ namespace ps2x::iop::detail
             logString("[IOP fdputs] ", a0);
             return true;
         case 14: // vfdprintf
-            logString("[IOP vfdprintf] ", a1);
+            logFormatted("[IOP vfdprintf] ", formatGuestString(m_memory, m_memory.readString(a1, 2048u), IopVaList{m_memory, cpu.gpr[6]}));
             return true;
         default:
             return false;

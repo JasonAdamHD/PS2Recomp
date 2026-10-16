@@ -145,6 +145,7 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            spuNextCycle = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
             activeCpu = nullptr;
@@ -433,6 +434,8 @@ namespace ps2x::iop::detail
             schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
+            if (totalCycles >= spuNextCycle)
+                syncSpu();
             return running;
         }
 
@@ -532,6 +535,38 @@ namespace ps2x::iop::detail
         }
 
         // Not that good to use exception handling for control flow but will do for now
+        // Runs the SPU2 up to the current cycle; an IRQA hit raises IOP interrupt 9 (SPU2).
+        void syncSpu()
+        {
+            IopSpu2 &spu = memory.spu2();
+            spu.advanceTo(totalCycles);
+            spuNextCycle = spu.nextSampleCycle();
+            if (spu.takeIrq())
+                pendingDmaInterrupts[kSpu2Irq] = totalCycles;
+        }
+
+        // PS2X_SPU_LOG=1 prints SPU2 activity once per second of IOP time.
+        const bool spuDiagnostics = std::getenv("PS2X_SPU_LOG") != nullptr;
+        uint64_t nextSpuLogCycle = kIopClockHz;
+
+        void flushSpuOutput()
+        {
+            if (spuDiagnostics && totalCycles >= nextSpuLogCycle)
+            {
+                nextSpuLogCycle = totalCycles + kIopClockHz;
+                const IopSpu2::Stats stats = memory.spu2().takeStats();
+                std::ostringstream out;
+                out << "[IOP:spu2] frames=" << stats.frames << " keyOn=" << stats.keyOns << " voices=" << stats.activeVoices
+                    << " dmaBytes=" << stats.dmaBytes << " portWrites=" << stats.manualWrites << " irqs=" << stats.irqs
+                    << " peak=" << stats.peak << " hotRead=0x" << std::hex << stats.hotReadOffset << std::dec << "x" << stats.hotReadCount;
+                log(LogLevel::Warning, out.str());
+            }
+            audioScratch.clear();
+            memory.spu2().takeOutput(audioScratch);
+            if (!audioScratch.empty())
+                host.audioSamples(audioScratch.data(), audioScratch.size() / 2u);
+        }
+
         void servicePendingDmaInterrupts()
         {
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
@@ -647,6 +682,7 @@ namespace ps2x::iop::detail
                             }
                         }
                     }
+                    syncSpu();
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -670,6 +706,8 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                syncSpu();
+                flushSpuOutput();
             }
             catch (...)
             {
@@ -793,6 +831,8 @@ namespace ps2x::iop::detail
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
         uint64_t totalCycles = 0;
+        uint64_t spuNextCycle = 0;
+        std::vector<int16_t> audioScratch;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
         CpuState *activeCpu = nullptr;
